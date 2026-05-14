@@ -28,6 +28,20 @@ function numberOrNull(value) {
     value && typeof value === 'object' && 'raw' in value
       ? value.raw
       : value
+   if (rawValue === null || rawValue === undefined) {
+    return null
+  }
+
+  if (typeof rawValue === 'string') {
+    const normalized = rawValue.trim().replaceAll(',', '')
+
+    if (!normalized || normalized === '--' || normalized.toUpperCase() === 'N/A') {
+      return null
+    }
+
+    const parsed = Number(normalized)
+    return Number.isFinite(parsed) ? parsed : null
+  }
   const parsed = Number(rawValue)
   return Number.isFinite(parsed) ? parsed : null
 }
