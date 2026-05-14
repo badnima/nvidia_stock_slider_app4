@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nima-stock-tracker
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FMP_API_KEY
+        sync: false
+      - key: FMP_CACHE_TTL_SECONDS
+        value: "300"
