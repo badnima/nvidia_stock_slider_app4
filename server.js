@@ -157,6 +157,81 @@ function sortByHighProximity(stocks) {
   })
 }
 
+function fmpErrorMessage(body, fallback) {
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    return (
+      readString(body['Error Message']) ||
+      readString(body.message) ||
+      readString(body.error) ||
+      readString(body.Information) ||
+      fallback
+    )
+  }
+
+  return fallback
+}
+
+async function fetchFmpJson(url, apiKey, label) {
+  const response = await fetch(url, {
+    headers: {
+      'user-agent': 'nima-stock-tracker/1.0',
+    },
+  })
+  const bodyText = await response.text()
+  const safeBodyText = bodyText.replaceAll(apiKey, '[redacted]')
+
+  let body = null
+  try {
+    body = bodyText ? JSON.parse(bodyText) : null
+  } catch {
+    throw new Error(`${label} returned non-JSON data: ${safeBodyText.slice(0, 160)}`)
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `${label} returned ${response.status}: ${fmpErrorMessage(body, safeBodyText.slice(0, 160))}`,
+    )
+  }
+
+  if (!Array.isArray(body)) {
+    throw new Error(`${label} rejected the request: ${fmpErrorMessage(body, 'unexpected response')}`)
+  }
+
+  return body
+}
+
+async function fetchQuotesFromFmp(symbols, apiKey) {
+  const legacyQuoteUrl = new URL(
+    `https://financialmodelingprep.com/api/v3/quote/${symbols.join(',')}`,
+  )
+  legacyQuoteUrl.searchParams.set('apikey', apiKey)
+
+  const stableBatchUrl = new URL('https://financialmodelingprep.com/stable/batch-quote')
+  stableBatchUrl.searchParams.set('symbols', symbols.join(','))
+  stableBatchUrl.searchParams.set('apikey', apiKey)
+
+  const attempts = [
+    ['FMP v3 quote', legacyQuoteUrl],
+    ['FMP stable batch quote', stableBatchUrl],
+  ]
+  const failures = []
+
+  for (const [label, url] of attempts) {
+    try {
+      const quotes = await fetchFmpJson(url, apiKey, label)
+
+      return {
+        quotes,
+        source: label,
+      }
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : `${label} failed`)
+    }
+  }
+
+  throw new Error(`FMP quote requests failed. ${failures.join(' | ')}`)
+}
+
 async function fetchFmpQuotes(symbols) {
   const apiKey = getApiKey()
   const now = new Date()
@@ -165,31 +240,13 @@ async function fetchFmpQuotes(symbols) {
     return {
       updatedAt: now.toISOString(),
       updatedLabel: formatDisplayTimestamp(now),
+      source: null,
       warning: 'Missing FMP_API_KEY. Add it as an environment variable on Render.',
       stocks: symbols.map((symbol) => normalizeQuote(symbol, null)),
     }
   }
 
-  const url = new URL('https://financialmodelingprep.com/stable/batch-quote')
-  url.searchParams.set('symbols', symbols.join(','))
-  url.searchParams.set('apikey', apiKey)
-
-  const response = await fetch(url, {
-    headers: {
-      'user-agent': 'nima-stock-tracker/1.0',
-    },
-  })
-
-  if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(`FMP returned ${response.status}: ${detail.slice(0, 160)}`)
-  }
-
-  const quotes = await response.json()
-
-  if (!Array.isArray(quotes)) {
-    throw new Error('FMP returned an unexpected response shape.')
-  }
+  const { quotes, source } = await fetchQuotesFromFmp(symbols, apiKey)
 
   const quoteBySymbol = new Map(
     quotes
@@ -202,6 +259,7 @@ async function fetchFmpQuotes(symbols) {
   return {
     updatedAt: now.toISOString(),
     updatedLabel: formatDisplayTimestamp(now),
+    source,
     warning: stocks.some((stock) => stock.currentPrice === null)
       ? 'Some configured symbols did not return complete FMP quote data.'
       : null,
@@ -249,6 +307,8 @@ app.get('/api/stocks', async (req, res) => {
     console.error('Failed to load stock data:', error)
     res.status(502).json({
       error: 'Unable to load stock data right now.',
+      detail: error instanceof Error ? error.message : 'Unknown stock data error.',
+      hint: 'Check that FMP_API_KEY is set on Render and that the key has access to FMP quote endpoints.',
     })
   }
 })

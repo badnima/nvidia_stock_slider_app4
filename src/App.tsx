@@ -18,9 +18,16 @@ type StockQuote = {
 type StocksPayload = {
   updatedAt: string | null
   updatedLabel: string | null
+  source: string | null
   warning: string | null
   cached: boolean
   stocks: StockQuote[]
+}
+
+type ApiErrorPayload = {
+  error?: string
+  detail?: string
+  hint?: string
 }
 
 const currencyFormatter = new Intl.NumberFormat('en-US', {
@@ -85,10 +92,13 @@ function App() {
       const response = await fetch(`/api/stocks${refresh ? '?refresh=true' : ''}`, {
         cache: 'no-store',
       })
-      const nextPayload = (await response.json()) as StocksPayload | { error?: string }
+      const nextPayload = (await response.json()) as StocksPayload | ApiErrorPayload
 
       if (!response.ok) {
-        throw new Error('error' in nextPayload ? nextPayload.error : 'Unable to load stock data.')
+        const apiError = nextPayload as ApiErrorPayload
+        throw new Error(
+          [apiError.error, apiError.detail, apiError.hint].filter(Boolean).join(' '),
+        )
       }
 
       setPayload(nextPayload as StocksPayload)
@@ -133,7 +143,7 @@ function App() {
         <div className="status-strip">
           <span>
             <Server size={16} />
-            FMP data loaded server-side
+            {payload?.source ? `${payload.source} loaded server-side` : 'FMP data loaded server-side'}
           </span>
           <span>
             <TrendingUp size={16} />
