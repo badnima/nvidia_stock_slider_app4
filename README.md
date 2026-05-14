@@ -45,6 +45,7 @@ Set this Render environment variable:
 Optional:
 
 - `FMP_CACHE_TTL_SECONDS`: in-memory quote cache TTL. Default is `300`.
+- `FMP_CONCURRENCY`: number of FMP symbol requests to run at once. Default is `4`.
 
 ## Troubleshooting Live Data
 
@@ -52,4 +53,5 @@ Open `/api/stocks` on the deployed Render URL.
 
 - If you see `Missing FMP_API_KEY`, add `FMP_API_KEY` in Render under Environment.
 - If you see an FMP access error, confirm the key is valid and has access to quote endpoints.
-- The server first tries `FMP v3 quote`, then falls back to `FMP stable batch quote`.
+- The server uses the current `FMP stable quote` endpoint per symbol.
+- EPS is filled from quote data when available, with a best-effort call to `FMP stable key metrics TTM`.

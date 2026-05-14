@@ -200,36 +200,161 @@ async function fetchFmpJson(url, apiKey, label) {
   return body
 }
 
-async function fetchQuotesFromFmp(symbols, apiKey) {
-  const legacyQuoteUrl = new URL(
-    `https://financialmodelingprep.com/api/v3/quote/${symbols.join(',')}`,
-  )
-  legacyQuoteUrl.searchParams.set('apikey', apiKey)
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length)
+  let nextIndex = 0
+  const workerCount = Math.min(Math.max(1, limit), items.length)
 
-  const stableBatchUrl = new URL('https://financialmodelingprep.com/stable/batch-quote')
-  stableBatchUrl.searchParams.set('symbols', symbols.join(','))
-  stableBatchUrl.searchParams.set('apikey', apiKey)
-
-  const attempts = [
-    ['FMP v3 quote', legacyQuoteUrl],
-    ['FMP stable batch quote', stableBatchUrl],
-  ]
-  const failures = []
-
-  for (const [label, url] of attempts) {
-    try {
-      const quotes = await fetchFmpJson(url, apiKey, label)
-
-      return {
-        quotes,
-        source: label,
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex
+        nextIndex += 1
+        results[currentIndex] = await mapper(items[currentIndex], currentIndex)
       }
-    } catch (error) {
-      failures.push(error instanceof Error ? error.message : `${label} failed`)
-    }
+    }),
+  )
+
+  return results
+}
+
+function summarizeFailures(label, failures) {
+  if (!failures.length) {
+    return null
   }
 
-  throw new Error(`FMP quote requests failed. ${failures.join(' | ')}`)
+  const examples = failures
+    .slice(0, 2)
+    .map((failure) => `${failure.symbol}: ${failure.error}`)
+    .join('; ')
+
+  return `${failures.length} ${label} request${failures.length === 1 ? '' : 's'} failed (${examples}).`
+}
+
+function quoteForSymbol(symbol, quotes) {
+  return (
+    quotes.find((quote) => readString(quote?.symbol)?.toUpperCase() === symbol) ||
+    quotes[0] ||
+    null
+  )
+}
+
+async function fetchStableQuote(symbol, apiKey) {
+  const url = new URL('https://financialmodelingprep.com/stable/quote')
+  url.searchParams.set('symbol', symbol)
+  url.searchParams.set('apikey', apiKey)
+
+  const quotes = await fetchFmpJson(url, apiKey, `FMP stable quote ${symbol}`)
+  const quote = quoteForSymbol(symbol, quotes)
+
+  if (!quote) {
+    throw new Error('FMP stable quote returned no records')
+  }
+
+  return quote
+}
+
+async function fetchStableMetrics(symbol, apiKey) {
+  const url = new URL('https://financialmodelingprep.com/stable/key-metrics-ttm')
+  url.searchParams.set('symbol', symbol)
+  url.searchParams.set('apikey', apiKey)
+
+  const metrics = await fetchFmpJson(url, apiKey, `FMP stable key metrics TTM ${symbol}`)
+
+  return quoteForSymbol(symbol, metrics)
+}
+
+async function fetchQuotesFromFmp(symbols, apiKey) {
+  const concurrency = parsePositiveInt(process.env.FMP_CONCURRENCY, 4)
+  const quoteResults = await mapWithConcurrency(symbols, concurrency, async (symbol) => {
+    try {
+      return {
+        symbol,
+        quote: await fetchStableQuote(symbol, apiKey),
+        error: null,
+      }
+    } catch (error) {
+      return {
+        symbol,
+        quote: null,
+        error: error instanceof Error ? error.message : 'Unknown FMP quote error',
+      }
+    }
+  })
+
+  const quoteFailures = quoteResults.filter((result) => result.error)
+  const successfulQuotes = quoteResults.filter((result) => result.quote)
+
+  if (!successfulQuotes.length) {
+    throw new Error(
+      `FMP stable quote failed for every configured symbol. ${summarizeFailures(
+        'quote',
+        quoteFailures,
+      )}`,
+    )
+  }
+
+  const symbolsNeedingEps = successfulQuotes
+    .filter((result) => firstNumber(result.quote?.eps, result.quote?.epsTTM) === null)
+    .map((result) => result.symbol)
+  const metricsBySymbol = new Map()
+  let metricsFailures = []
+
+  if (symbolsNeedingEps.length) {
+    const metricResults = await mapWithConcurrency(symbolsNeedingEps, concurrency, async (symbol) => {
+      try {
+        return {
+          symbol,
+          metrics: await fetchStableMetrics(symbol, apiKey),
+          error: null,
+        }
+      } catch (error) {
+        return {
+          symbol,
+          metrics: null,
+          error: error instanceof Error ? error.message : 'Unknown FMP metrics error',
+        }
+      }
+    })
+
+    for (const result of metricResults) {
+      if (result.metrics) {
+        metricsBySymbol.set(result.symbol, result.metrics)
+      }
+    }
+
+    metricsFailures = metricResults.filter((result) => result.error)
+  }
+
+  const quotes = successfulQuotes.map(({ symbol, quote }) => {
+    const metrics = metricsBySymbol.get(symbol)
+    const eps = firstNumber(
+      quote?.eps,
+      quote?.epsTTM,
+      metrics?.netIncomePerShareTTM,
+      metrics?.epsTTM,
+      metrics?.eps,
+    )
+
+    return {
+      ...quote,
+      symbol,
+      eps,
+    }
+  })
+
+  const warning = [
+    summarizeFailures('quote', quoteFailures),
+    summarizeFailures('EPS metrics', metricsFailures),
+  ]
+    .filter(Boolean)
+    .join(' ')
+
+  return {
+    quotes,
+    source: 'FMP stable quote',
+    warning: warning || null,
+  }
 }
 
 async function fetchFmpQuotes(symbols) {
@@ -246,7 +371,7 @@ async function fetchFmpQuotes(symbols) {
     }
   }
 
-  const { quotes, source } = await fetchQuotesFromFmp(symbols, apiKey)
+  const { quotes, source, warning: fetchWarning } = await fetchQuotesFromFmp(symbols, apiKey)
 
   const quoteBySymbol = new Map(
     quotes
@@ -255,14 +380,22 @@ async function fetchFmpQuotes(symbols) {
   )
 
   const stocks = symbols.map((symbol) => normalizeQuote(symbol, quoteBySymbol.get(symbol)))
+  const incompleteSymbols = stocks
+    .filter((stock) => stock.currentPrice === null)
+    .map((stock) => stock.symbol)
+  const incompleteWarning = incompleteSymbols.length
+    ? `${incompleteSymbols.length} configured symbol${
+        incompleteSymbols.length === 1 ? '' : 's'
+      } did not return complete FMP quote data: ${incompleteSymbols.slice(0, 8).join(', ')}${
+        incompleteSymbols.length > 8 ? ', ...' : ''
+      }.`
+    : null
 
   return {
     updatedAt: now.toISOString(),
     updatedLabel: formatDisplayTimestamp(now),
     source,
-    warning: stocks.some((stock) => stock.currentPrice === null)
-      ? 'Some configured symbols did not return complete FMP quote data.'
-      : null,
+    warning: [fetchWarning, incompleteWarning].filter(Boolean).join(' ') || null,
     stocks: sortByHighProximity(stocks),
   }
 }
