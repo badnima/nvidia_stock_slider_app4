@@ -96,9 +96,7 @@ function App() {
 
       if (!response.ok) {
         const apiError = nextPayload as ApiErrorPayload
-        throw new Error(
-          [apiError.error, apiError.detail, apiError.hint].filter(Boolean).join(' '),
-        )
+        throw new Error([apiError.error, apiError.hint].filter(Boolean).join(' '))
       }
 
       setPayload(nextPayload as StocksPayload)

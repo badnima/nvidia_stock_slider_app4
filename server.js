@@ -10,6 +10,7 @@ const port = process.env.PORT || 3000
 
 const stocksFile = path.join(__dirname, 'stocks.json')
 const distDir = path.join(__dirname, 'dist')
+const cacheFile = path.join(__dirname, '.stock-cache.json')
 const cacheTtlMs = parsePositiveInt(process.env.FMP_CACHE_TTL_SECONDS, 300) * 1000
 
 let stockCache = {
@@ -28,7 +29,7 @@ function numberOrNull(value) {
     value && typeof value === 'object' && 'raw' in value
       ? value.raw
       : value
-   if (rawValue === null || rawValue === undefined) {
+  if (rawValue === null || rawValue === undefined) {
     return null
   }
 
@@ -42,6 +43,7 @@ function numberOrNull(value) {
     const parsed = Number(normalized)
     return Number.isFinite(parsed) ? parsed : null
   }
+
   const parsed = Number(rawValue)
   return Number.isFinite(parsed) ? parsed : null
 }
@@ -59,6 +61,55 @@ function firstNumber(...values) {
 
 function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+async function readPersistedCache() {
+  try {
+    const rawCache = await fs.readFile(cacheFile, 'utf8')
+    const parsed = JSON.parse(rawCache)
+
+    if (!parsed || typeof parsed !== 'object' || !parsed.payload || !Array.isArray(parsed.payload.stocks)) {
+      return null
+    }
+
+    return parsed
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return null
+    }
+
+    console.warn('Failed to read persisted stock cache:', error)
+    return null
+  }
+}
+
+async function writePersistedCache(symbolsKey, payload) {
+  try {
+    await fs.writeFile(
+      cacheFile,
+      JSON.stringify(
+        {
+          symbolsKey,
+          persistedAt: new Date().toISOString(),
+          payload,
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+  } catch (error) {
+    console.warn('Failed to write persisted stock cache:', error)
+  }
+}
+
+function buildStalePayload(payload, detail) {
+  return {
+    ...payload,
+    cached: true,
+    stale: true,
+    warning: [payload.warning, detail].filter(Boolean).join(' ') || null,
+  }
 }
 
 function parseRange(value) {
@@ -316,6 +367,18 @@ async function fetchStableQuote(symbol, apiKey) {
   return quote
 }
 
+async function fetchBatchQuote(symbols, apiKey) {
+  if (!symbols.length) {
+    return []
+  }
+
+  const url = new URL('https://financialmodelingprep.com/stable/batch-quote')
+  url.searchParams.set('symbols', symbols.join(','))
+  url.searchParams.set('apikey', apiKey)
+
+  return fetchFmpJson(url, apiKey, `FMP batch quote (${symbols.length} symbols)`)
+}
+
 async function fetchStableMetrics(symbol, apiKey) {
   const url = new URL('https://financialmodelingprep.com/stable/key-metrics-ttm')
   url.searchParams.set('symbol', symbol)
@@ -380,31 +443,53 @@ async function fetchYahooQuotes(symbols) {
 
 async function fetchQuotesFromFmp(symbols, apiKey) {
   const concurrency = parsePositiveInt(process.env.FMP_CONCURRENCY, 4)
-  const quoteResults = await mapWithConcurrency(symbols, concurrency, async (symbol) => {
-    try {
-      return {
-        symbol,
-        quote: await fetchStableQuote(symbol, apiKey),
-        error: null,
-      }
-    } catch (error) {
-      return {
-        symbol,
-        quote: null,
-        error: error instanceof Error ? error.message : 'Unknown FMP quote error',
-      }
-    }
-  })
+  const profileFallbackLimit = parsePositiveInt(process.env.FMP_PROFILE_FALLBACK_LIMIT, 4)
+  const quoteFailures = []
+  let successfulQuotes = []
+  let profileSymbols = []
 
-  const quoteFailures = quoteResults.filter((result) => result.error)
-  const successfulQuotes = quoteResults
-    .filter((result) => result.quote)
-    .map(({ symbol, quote }) => ({
-      symbol,
-      quote,
-      source: 'FMP',
-    }))
-  const profileSymbols = quoteFailures.map((result) => result.symbol)
+  try {
+    const batchQuotes = await fetchBatchQuote(symbols, apiKey)
+    const batchQuotesBySymbol = new Map(
+      batchQuotes
+        .filter((quote) => readString(quote?.symbol))
+        .map((quote) => [quote.symbol.trim().toUpperCase(), quote]),
+    )
+
+    successfulQuotes = symbols
+      .map((symbol) => {
+        const quote = batchQuotesBySymbol.get(symbol)
+
+        if (!quote) {
+          quoteFailures.push({
+            symbol,
+            error: 'FMP batch quote returned no record',
+          })
+          return null
+        }
+
+        return {
+          symbol,
+          quote,
+          source: 'FMP',
+        }
+      })
+      .filter(Boolean)
+
+    const unresolvedBatchSymbols = symbols.filter((symbol) => !batchQuotesBySymbol.has(symbol))
+    profileSymbols =
+      unresolvedBatchSymbols.length <= profileFallbackLimit ? unresolvedBatchSymbols : []
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown FMP batch quote error'
+
+    for (const symbol of symbols) {
+      quoteFailures.push({
+        symbol,
+        error: message,
+      })
+    }
+  }
+
   let profileFailures = []
   let profileQuotes = []
 
@@ -581,12 +666,12 @@ async function fetchQuotesFromFmp(symbols, apiKey) {
     quotes,
     source:
       [
-        fmpSuccessCount ? 'FMP stable quote' : null,
+        fmpSuccessCount ? 'FMP batch quote' : null,
         profileSuccessCount ? 'FMP stable profile' : null,
         fallbackSuccessCount ? 'Yahoo fallback' : null,
       ]
         .filter(Boolean)
-        .join(' + ') || 'FMP stable quote',
+        .join(' + ') || 'FMP batch quote',
     warning: warning || null,
   }
 }
@@ -646,16 +731,43 @@ async function buildStocksPayload({ force = false } = {}) {
     }
   }
 
-  const payload = await fetchFmpQuotes(symbols)
-  stockCache = {
-    symbolsKey,
-    expiresAt: now + cacheTtlMs,
-    payload,
-  }
+  try {
+    const payload = await fetchFmpQuotes(symbols)
+    stockCache = {
+      symbolsKey,
+      expiresAt: now + cacheTtlMs,
+      payload,
+    }
+    await writePersistedCache(symbolsKey, payload)
 
-  return {
-    ...payload,
-    cached: false,
+    return {
+      ...payload,
+      cached: false,
+      stale: false,
+    }
+  } catch (error) {
+    const fallbackDetail = `Showing cached stock data because the live refresh failed: ${
+      error instanceof Error ? error.message : 'Unknown stock data error.'
+    }`
+    const persistedCache = await readPersistedCache()
+    const fallbackPayload =
+      stockCache.payload && stockCache.symbolsKey === symbolsKey
+        ? stockCache.payload
+        : persistedCache?.symbolsKey === symbolsKey
+          ? persistedCache.payload
+          : null
+
+    if (fallbackPayload) {
+      stockCache = {
+        symbolsKey,
+        expiresAt: now + cacheTtlMs,
+        payload: fallbackPayload,
+      }
+
+      return buildStalePayload(fallbackPayload, fallbackDetail)
+    }
+
+    throw error
   }
 }
 
