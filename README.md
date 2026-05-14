@@ -53,5 +53,7 @@ Open `/api/stocks` on the deployed Render URL.
 
 - If you see `Missing FMP_API_KEY`, add `FMP_API_KEY` in Render under Environment.
 - If you see an FMP access error, confirm the key is valid and has access to quote endpoints.
-- The server uses the current `FMP stable quote` endpoint per symbol.
+- The server tries `FMP stable quote` first for each symbol.
+- If FMP quote blocks a symbol under the current subscription, the server tries `FMP stable profile`.
+- If FMP profile also cannot return the symbol, the server tries Yahoo Finance as a last-resort fallback.
 - EPS is filled from quote data when available, with a best-effort call to `FMP stable key metrics TTM`.

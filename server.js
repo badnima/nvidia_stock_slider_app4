@@ -24,7 +24,11 @@ function parsePositiveInt(value, fallback) {
 }
 
 function numberOrNull(value) {
-  const parsed = Number(value)
+  const rawValue =
+    value && typeof value === 'object' && 'raw' in value
+      ? value.raw
+      : value
+  const parsed = Number(rawValue)
   return Number.isFinite(parsed) ? parsed : null
 }
 
@@ -41,6 +45,29 @@ function firstNumber(...values) {
 
 function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function parseRange(value) {
+  const range = readString(value)
+  if (!range) {
+    return {
+      low: null,
+      high: null,
+    }
+  }
+
+  const match = range.match(/([\d.,]+)\s*-\s*([\d.,]+)/)
+  if (!match) {
+    return {
+      low: null,
+      high: null,
+    }
+  }
+
+  return {
+    low: numberOrNull(match[1].replaceAll(',', '')),
+    high: numberOrNull(match[2].replaceAll(',', '')),
+  }
 }
 
 function formatDisplayTimestamp(date) {
@@ -103,22 +130,40 @@ function positionPercent(stock) {
 }
 
 function normalizeQuote(symbol, quote) {
-  const currentPrice = firstNumber(quote?.price, quote?.currentPrice, quote?.lastPrice)
+  const range = parseRange(quote?.range)
+  const currentPrice = firstNumber(
+    quote?.price,
+    quote?.currentPrice,
+    quote?.lastPrice,
+    quote?.regularMarketPrice,
+  )
   const week52Low = firstNumber(
     quote?.yearLow,
     quote?.week52Low,
     quote?.low52Week,
     quote?.fiftyTwoWeekLow,
+    range.low,
   )
   const week52High = firstNumber(
     quote?.yearHigh,
     quote?.week52High,
     quote?.high52Week,
     quote?.fiftyTwoWeekHigh,
+    range.high,
   )
-  const marketCap = firstNumber(quote?.marketCap, quote?.market_cap)
-  const eps = firstNumber(quote?.eps, quote?.epsTTM)
-  const name = readString(quote?.name) || readString(quote?.companyName) || symbol
+  const marketCap = firstNumber(quote?.marketCap, quote?.market_cap, quote?.mktCap)
+  const eps = firstNumber(
+    quote?.eps,
+    quote?.epsTTM,
+    quote?.epsTrailingTwelveMonths,
+    quote?.trailingEps,
+  )
+  const name =
+    readString(quote?.name) ||
+    readString(quote?.companyName) ||
+    readString(quote?.shortName) ||
+    readString(quote?.longName) ||
+    symbol
 
   const normalized = {
     symbol,
@@ -128,7 +173,10 @@ function normalizeQuote(symbol, quote) {
     currentPrice,
     week52Low,
     week52High,
-    exchange: readString(quote?.exchange) || readString(quote?.exchangeShortName),
+    exchange:
+      readString(quote?.exchange) ||
+      readString(quote?.exchangeShortName) ||
+      readString(quote?.fullExchangeName),
   }
 
   const percent = positionPercent(normalized)
@@ -264,6 +312,58 @@ async function fetchStableMetrics(symbol, apiKey) {
   return quoteForSymbol(symbol, metrics)
 }
 
+async function fetchStableProfile(symbol, apiKey) {
+  const url = new URL('https://financialmodelingprep.com/stable/profile')
+  url.searchParams.set('symbol', symbol)
+  url.searchParams.set('apikey', apiKey)
+
+  const profiles = await fetchFmpJson(url, apiKey, `FMP stable profile ${symbol}`)
+  const profile = quoteForSymbol(symbol, profiles)
+
+  if (!profile) {
+    throw new Error('FMP stable profile returned no records')
+  }
+
+  return profile
+}
+
+async function fetchYahooQuotes(symbols) {
+  if (!symbols.length) {
+    return []
+  }
+
+  const url = new URL('https://query1.finance.yahoo.com/v7/finance/quote')
+  url.searchParams.set('symbols', symbols.join(','))
+
+  const response = await fetch(url, {
+    headers: {
+      accept: 'application/json',
+      'user-agent': 'nima-stock-tracker/1.0',
+    },
+  })
+  const bodyText = await response.text()
+
+  if (!response.ok) {
+    throw new Error(`Yahoo Finance returned ${response.status}: ${bodyText.slice(0, 160)}`)
+  }
+
+  let body = null
+  try {
+    body = JSON.parse(bodyText)
+  } catch {
+    throw new Error(`Yahoo Finance returned non-JSON data: ${bodyText.slice(0, 160)}`)
+  }
+
+  const quotes = body?.quoteResponse?.result
+
+  if (!Array.isArray(quotes)) {
+    const message = readString(body?.quoteResponse?.error?.description) || 'unexpected response'
+    throw new Error(`Yahoo Finance rejected the request: ${message}`)
+  }
+
+  return quotes
+}
+
 async function fetchQuotesFromFmp(symbols, apiKey) {
   const concurrency = parsePositiveInt(process.env.FMP_CONCURRENCY, 4)
   const quoteResults = await mapWithConcurrency(symbols, concurrency, async (symbol) => {
@@ -283,19 +383,103 @@ async function fetchQuotesFromFmp(symbols, apiKey) {
   })
 
   const quoteFailures = quoteResults.filter((result) => result.error)
-  const successfulQuotes = quoteResults.filter((result) => result.quote)
+  const successfulQuotes = quoteResults
+    .filter((result) => result.quote)
+    .map(({ symbol, quote }) => ({
+      symbol,
+      quote,
+      source: 'FMP',
+    }))
+  const profileSymbols = quoteFailures.map((result) => result.symbol)
+  let profileFailures = []
+  let profileQuotes = []
 
-  if (!successfulQuotes.length) {
+  if (profileSymbols.length) {
+    const profileResults = await mapWithConcurrency(profileSymbols, concurrency, async (symbol) => {
+      try {
+        return {
+          symbol,
+          quote: await fetchStableProfile(symbol, apiKey),
+          error: null,
+        }
+      } catch (error) {
+        return {
+          symbol,
+          quote: null,
+          error: error instanceof Error ? error.message : 'Unknown FMP profile error',
+        }
+      }
+    })
+
+    profileFailures = profileResults.filter((result) => result.error)
+    profileQuotes = profileResults
+      .filter((result) => result.quote)
+      .map(({ symbol, quote }) => ({
+        symbol,
+        quote,
+        source: 'FMP profile',
+      }))
+  }
+
+  const profileResolvedSymbols = new Set(profileQuotes.map((result) => result.symbol))
+  const fallbackSymbols = quoteFailures
+    .map((result) => result.symbol)
+    .filter((symbol) => !profileResolvedSymbols.has(symbol))
+  const fallbackFailures = []
+  let fallbackQuotes = []
+
+  if (fallbackSymbols.length) {
+    try {
+      const yahooQuotes = await fetchYahooQuotes(fallbackSymbols)
+      const yahooQuoteBySymbol = new Map(
+        yahooQuotes
+          .filter((quote) => readString(quote?.symbol))
+          .map((quote) => [quote.symbol.trim().toUpperCase(), quote]),
+      )
+
+      fallbackQuotes = fallbackSymbols
+        .map((symbol) => ({
+          symbol,
+          quote: yahooQuoteBySymbol.get(symbol) || null,
+          source: 'Yahoo Finance',
+        }))
+        .filter((result) => result.quote)
+
+      const fallbackQuoteSymbols = new Set(fallbackQuotes.map((result) => result.symbol))
+
+      for (const symbol of fallbackSymbols) {
+        if (!fallbackQuoteSymbols.has(symbol)) {
+          fallbackFailures.push({
+            symbol,
+            error: 'Yahoo Finance returned no quote record',
+          })
+        }
+      }
+    } catch (error) {
+      for (const symbol of fallbackSymbols) {
+        fallbackFailures.push({
+          symbol,
+          error: error instanceof Error ? error.message : 'Unknown Yahoo Finance fallback error',
+        })
+      }
+    }
+  }
+
+  const allSuccessfulQuotes = [...successfulQuotes, ...profileQuotes, ...fallbackQuotes]
+
+  if (!allSuccessfulQuotes.length) {
     throw new Error(
-      `FMP stable quote failed for every configured symbol. ${summarizeFailures(
-        'quote',
-        quoteFailures,
-      )}`,
+      `No quote provider returned data. ${summarizeFailures('FMP quote', quoteFailures)} ${
+        summarizeFailures('FMP profile', profileFailures) || ''
+      } ${
+        summarizeFailures('Yahoo fallback', fallbackFailures) || ''
+      }`,
     )
   }
 
-  const symbolsNeedingEps = successfulQuotes
+  const symbolsNeedingEps = allSuccessfulQuotes
     .filter((result) => firstNumber(result.quote?.eps, result.quote?.epsTTM) === null)
+    .filter((result) => result.source === 'FMP')
     .map((result) => result.symbol)
   const metricsBySymbol = new Map()
   let metricsFailures = []
@@ -326,11 +510,13 @@ async function fetchQuotesFromFmp(symbols, apiKey) {
     metricsFailures = metricResults.filter((result) => result.error)
   }
 
-  const quotes = successfulQuotes.map(({ symbol, quote }) => {
+  const quotes = allSuccessfulQuotes.map(({ symbol, quote }) => {
     const metrics = metricsBySymbol.get(symbol)
     const eps = firstNumber(
       quote?.eps,
       quote?.epsTTM,
+      quote?.epsTrailingTwelveMonths,
+      quote?.trailingEps,
       metrics?.netIncomePerShareTTM,
       metrics?.epsTTM,
       metrics?.eps,
@@ -342,9 +528,36 @@ async function fetchQuotesFromFmp(symbols, apiKey) {
       eps,
     }
   })
+  const fmpSuccessCount = successfulQuotes.length
+  const profileSuccessCount = profileQuotes.length
+  const fallbackSuccessCount = fallbackQuotes.length
+  const profileMessage =
+    profileSuccessCount > 0
+      ? `${profileSuccessCount} symbol${
+          profileSuccessCount === 1 ? '' : 's'
+        } were blocked by FMP quote and filled with FMP profile data.`
+      : null
+  const fallbackMessage =
+    fallbackSuccessCount > 0
+      ? `${fallbackSuccessCount} symbol${
+          fallbackSuccessCount === 1 ? '' : 's'
+        } were blocked by FMP and filled with Yahoo Finance fallback.`
+      : null
+  const fallbackResolvedSymbols = new Set(fallbackQuotes.map((result) => result.symbol))
+  const unresolvedFmpFailures = quoteFailures.filter(
+    (failure) =>
+      !profileResolvedSymbols.has(failure.symbol) && !fallbackResolvedSymbols.has(failure.symbol),
+  )
+  const unresolvedProfileFailures = profileFailures.filter(
+    (failure) => !fallbackResolvedSymbols.has(failure.symbol),
+  )
 
   const warning = [
-    summarizeFailures('quote', quoteFailures),
+    profileMessage,
+    fallbackMessage,
+    summarizeFailures('FMP quote', unresolvedFmpFailures),
+    summarizeFailures('FMP profile', unresolvedProfileFailures),
+    summarizeFailures('Yahoo fallback', fallbackFailures),
     summarizeFailures('EPS metrics', metricsFailures),
   ]
     .filter(Boolean)
@@ -352,7 +565,14 @@ async function fetchQuotesFromFmp(symbols, apiKey) {
 
   return {
     quotes,
-    source: 'FMP stable quote',
+    source:
+      [
+        fmpSuccessCount ? 'FMP stable quote' : null,
+        profileSuccessCount ? 'FMP stable profile' : null,
+        fallbackSuccessCount ? 'Yahoo fallback' : null,
+      ]
+        .filter(Boolean)
+        .join(' + ') || 'FMP stable quote',
     warning: warning || null,
   }
 }
@@ -386,7 +606,7 @@ async function fetchFmpQuotes(symbols) {
   const incompleteWarning = incompleteSymbols.length
     ? `${incompleteSymbols.length} configured symbol${
         incompleteSymbols.length === 1 ? '' : 's'
-      } did not return complete FMP quote data: ${incompleteSymbols.slice(0, 8).join(', ')}${
+      } did not return complete quote data: ${incompleteSymbols.slice(0, 8).join(', ')}${
         incompleteSymbols.length > 8 ? ', ...' : ''
       }.`
     : null
