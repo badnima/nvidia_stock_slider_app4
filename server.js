@@ -112,6 +112,24 @@ function buildStalePayload(payload, detail) {
   }
 }
 
+function buildErrorHint(error) {
+  const message = error instanceof Error ? error.message : String(error || '')
+
+  if (message.includes('Missing FMP_API_KEY')) {
+    return 'FMP_API_KEY is missing on Render. Add it under the web service Environment settings and redeploy.'
+  }
+
+  if (message.includes('429') || message.includes('Limit Reach')) {
+    return 'Financial Modeling Prep rate-limited this app. The free tier allows a limited number of daily requests, so you may need to wait for the quota reset, reduce refreshes, or upgrade the FMP plan.'
+  }
+
+  if (message.includes('403') || message.includes('401') || message.includes('403 Forbidden')) {
+    return 'FMP rejected the request. Verify that FMP_API_KEY on Render is valid and that the key has access to the quote endpoints used by this app.'
+  }
+
+  return 'Check that FMP_API_KEY is set on Render and that the key has access to FMP quote endpoints.'
+}
+
 function parseRange(value) {
   const range = readString(value)
   if (!range) {
@@ -787,7 +805,7 @@ app.get('/api/stocks', async (req, res) => {
     res.status(502).json({
       error: 'Unable to load stock data right now.',
       detail: error instanceof Error ? error.message : 'Unknown stock data error.',
-      hint: 'Check that FMP_API_KEY is set on Render and that the key has access to FMP quote endpoints.',
+      hint: buildErrorHint(error),
     })
   }
 })
