@@ -2,6 +2,7 @@ import 'dotenv/config'
 import express from 'express'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { createClient } from 'redis'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -37,6 +38,10 @@ let fundamentalsCache = {
   marketCapFetchedAt: 0,
   bySymbol: new Map(),
 }
+
+let keyValueClient = null
+let keyValueConnectPromise = null
+let keyValueDisabled = false
 
 function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(value, 10)
@@ -83,38 +88,112 @@ function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
+function getKeyValueUrl() {
+  return (
+    process.env.RENDER_KEY_VALUE_URL ||
+    process.env.REDIS_URL ||
+    process.env.KEY_VALUE_URL ||
+    null
+  )
+}
+
 function mapToObject(map) {
   return Object.fromEntries([...map.entries()].sort(([left], [right]) => left.localeCompare(right)))
 }
 
-async function readPersistedCache() {
+function cacheStorageKey(symbolsKey) {
+  return `nima-stock-tracker:cache:${symbolsKey}`
+}
+
+async function getKeyValueClient() {
+  const url = getKeyValueUrl()
+
+  if (!url || keyValueDisabled) {
+    return null
+  }
+
+  if (keyValueClient?.isReady) {
+    return keyValueClient
+  }
+
+  if (keyValueConnectPromise) {
+    return keyValueConnectPromise
+  }
+
+  const client = createClient({
+    url,
+    socket: {
+      reconnectStrategy: false,
+    },
+  })
+
+  client.on('error', (error) => {
+    console.warn('Render Key Value client error:', error)
+  })
+
+  keyValueConnectPromise = client
+    .connect()
+    .then(() => {
+      keyValueClient = client
+      return client
+    })
+    .catch((error) => {
+      keyValueDisabled = true
+      keyValueClient = null
+      console.warn('Failed to connect to Render Key Value, falling back to local cache:', error)
+      return null
+    })
+    .finally(() => {
+      keyValueConnectPromise = null
+    })
+
+  return keyValueConnectPromise
+}
+
+function parsePersistedCacheRecord(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return null
+  }
+
+  const persistedPayload =
+    parsed.payload && Array.isArray(parsed.payload.stocks) ? parsed.payload : null
+  const persistedFundamentals =
+    parsed.fundamentalsBySymbol && typeof parsed.fundamentalsBySymbol === 'object'
+      ? new Map(
+          Object.entries(parsed.fundamentalsBySymbol).filter(
+            ([symbol, value]) => symbol && value && typeof value === 'object',
+          ),
+        )
+      : new Map()
+
+  return {
+    symbolsKey: readString(parsed.symbolsKey) || '',
+    payload: persistedPayload,
+    persistedAt: readString(parsed.persistedAt),
+    marketCapFetchedAt:
+      numberOrNull(parsed.marketCapFetchedAt) || numberOrNull(parsed.fundamentalsFetchedAt) || 0,
+    fundamentalsBySymbol: persistedFundamentals,
+  }
+}
+
+async function readPersistedCache(symbolsKey) {
+  const client = await getKeyValueClient()
+
+  if (client) {
+    try {
+      const cached = await client.get(cacheStorageKey(symbolsKey))
+
+      if (cached) {
+        return parsePersistedCacheRecord(JSON.parse(cached))
+      }
+    } catch (error) {
+      console.warn('Failed to read persisted cache from Render Key Value:', error)
+    }
+  }
+
   try {
     const rawCache = await fs.readFile(cacheFile, 'utf8')
-    const parsed = JSON.parse(rawCache)
-
-    if (!parsed || typeof parsed !== 'object') {
-      return null
-    }
-
-    const persistedPayload =
-      parsed.payload && Array.isArray(parsed.payload.stocks) ? parsed.payload : null
-    const persistedFundamentals =
-      parsed.fundamentalsBySymbol && typeof parsed.fundamentalsBySymbol === 'object'
-        ? new Map(
-            Object.entries(parsed.fundamentalsBySymbol).filter(
-              ([symbol, value]) => symbol && value && typeof value === 'object',
-            ),
-          )
-        : new Map()
-
-    return {
-      symbolsKey: readString(parsed.symbolsKey) || '',
-      payload: persistedPayload,
-      persistedAt: readString(parsed.persistedAt),
-      marketCapFetchedAt:
-        numberOrNull(parsed.marketCapFetchedAt) || numberOrNull(parsed.fundamentalsFetchedAt) || 0,
-      fundamentalsBySymbol: persistedFundamentals,
-    }
+    return parsePersistedCacheRecord(JSON.parse(rawCache))
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
       return null
@@ -126,20 +205,28 @@ async function readPersistedCache() {
 }
 
 async function writePersistedCache(symbolsKey, payload, bySymbol, marketCapFetchedAt) {
+  const persistedRecord = {
+    symbolsKey,
+    persistedAt: new Date().toISOString(),
+    marketCapFetchedAt,
+    fundamentalsBySymbol: mapToObject(bySymbol),
+    payload,
+  }
+
+  const client = await getKeyValueClient()
+
+  if (client) {
+    try {
+      await client.set(cacheStorageKey(symbolsKey), JSON.stringify(persistedRecord))
+    } catch (error) {
+      console.warn('Failed to write persisted cache to Render Key Value:', error)
+    }
+  }
+
   try {
-    await fs.writeFile(
+      await fs.writeFile(
       cacheFile,
-      JSON.stringify(
-        {
-          symbolsKey,
-          persistedAt: new Date().toISOString(),
-          marketCapFetchedAt,
-          fundamentalsBySymbol: mapToObject(bySymbol),
-          payload,
-        },
-        null,
-        2,
-      ),
+      JSON.stringify(persistedRecord, null, 2),
       'utf8',
     )
   } catch (error) {
@@ -169,6 +256,10 @@ function buildErrorHint(error) {
 
   if (message.includes('401') || message.includes('403')) {
     return 'Twelve Data rejected the request. Verify that TWELVE_DATA_API_KEY on Render is valid and has access to quote and earnings endpoints.'
+  }
+
+  if (message.includes('Key Value')) {
+    return 'Render Key Value is unavailable. Verify that RENDER_KEY_VALUE_URL is set and points to your Render Key Value instance.'
   }
 
   return 'Check that TWELVE_DATA_API_KEY is set on Render and that the key has access to Twelve Data quote endpoints.'
@@ -796,7 +887,7 @@ async function buildStocksPayload({ force = false } = {}) {
   const symbols = await readConfiguredSymbols()
   const symbolsKey = symbols.join(',')
   const now = Date.now()
-  const persistedCache = await readPersistedCache()
+  const persistedCache = await readPersistedCache(symbolsKey)
 
   loadPersistedCachesIfNeeded(symbolsKey, persistedCache)
 
