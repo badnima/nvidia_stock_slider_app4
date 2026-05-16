@@ -11,12 +11,28 @@ const port = process.env.PORT || 3000
 const stocksFile = path.join(__dirname, 'stocks.json')
 const distDir = path.join(__dirname, 'dist')
 const cacheFile = path.join(__dirname, '.stock-cache.json')
-const cacheTtlMs = parsePositiveInt(process.env.FMP_CACHE_TTL_SECONDS, 300) * 1000
+const quoteCacheTtlMs =
+  parsePositiveInt(
+    process.env.TWELVE_DATA_QUOTE_CACHE_SECONDS ||
+      process.env.TWELVE_DATA_CACHE_TTL_SECONDS ||
+      process.env.FMP_CACHE_TTL_SECONDS,
+    300,
+  ) * 1000
+const fundamentalsCacheTtlMs =
+  parsePositiveInt(process.env.TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS, 86400) * 1000
+const statsConcurrency = parsePositiveInt(process.env.TWELVE_DATA_STATS_CONCURRENCY, 4)
 
 let stockCache = {
   symbolsKey: '',
   expiresAt: 0,
+  fetchedAt: 0,
   payload: null,
+}
+
+let fundamentalsCache = {
+  symbolsKey: '',
+  fetchedAt: 0,
+  bySymbol: new Map(),
 }
 
 function parsePositiveInt(value, fallback) {
@@ -29,6 +45,7 @@ function numberOrNull(value) {
     value && typeof value === 'object' && 'raw' in value
       ? value.raw
       : value
+
   if (rawValue === null || rawValue === undefined) {
     return null
   }
@@ -63,16 +80,37 @@ function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
+function mapToObject(map) {
+  return Object.fromEntries([...map.entries()].sort(([left], [right]) => left.localeCompare(right)))
+}
+
 async function readPersistedCache() {
   try {
     const rawCache = await fs.readFile(cacheFile, 'utf8')
     const parsed = JSON.parse(rawCache)
 
-    if (!parsed || typeof parsed !== 'object' || !parsed.payload || !Array.isArray(parsed.payload.stocks)) {
+    if (!parsed || typeof parsed !== 'object') {
       return null
     }
 
-    return parsed
+    const persistedPayload =
+      parsed.payload && Array.isArray(parsed.payload.stocks) ? parsed.payload : null
+    const persistedFundamentals =
+      parsed.fundamentalsBySymbol && typeof parsed.fundamentalsBySymbol === 'object'
+        ? new Map(
+            Object.entries(parsed.fundamentalsBySymbol).filter(
+              ([symbol, value]) => symbol && value && typeof value === 'object',
+            ),
+          )
+        : new Map()
+
+    return {
+      symbolsKey: readString(parsed.symbolsKey) || '',
+      payload: persistedPayload,
+      persistedAt: readString(parsed.persistedAt),
+      fundamentalsFetchedAt: numberOrNull(parsed.fundamentalsFetchedAt) || 0,
+      fundamentalsBySymbol: persistedFundamentals,
+    }
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
       return null
@@ -83,7 +121,7 @@ async function readPersistedCache() {
   }
 }
 
-async function writePersistedCache(symbolsKey, payload) {
+async function writePersistedCache(symbolsKey, payload, bySymbol, fundamentalsFetchedAt) {
   try {
     await fs.writeFile(
       cacheFile,
@@ -91,6 +129,8 @@ async function writePersistedCache(symbolsKey, payload) {
         {
           symbolsKey,
           persistedAt: new Date().toISOString(),
+          fundamentalsFetchedAt,
+          fundamentalsBySymbol: mapToObject(bySymbol),
           payload,
         },
         null,
@@ -115,19 +155,19 @@ function buildStalePayload(payload, detail) {
 function buildErrorHint(error) {
   const message = error instanceof Error ? error.message : String(error || '')
 
-  if (message.includes('Missing FMP_API_KEY')) {
-    return 'FMP_API_KEY is missing on Render. Add it under the web service Environment settings and redeploy.'
+  if (message.includes('Missing TWELVE_DATA_API_KEY')) {
+    return 'TWELVE_DATA_API_KEY is missing on Render. Add it under the web service Environment settings and redeploy.'
   }
 
-  if (message.includes('429') || message.includes('Limit Reach')) {
-    return 'Financial Modeling Prep rate-limited this app. The free tier allows a limited number of daily requests, so you may need to wait for the quota reset, reduce refreshes, or upgrade the FMP plan.'
+  if (message.includes('429') || message.includes('Too Many Requests')) {
+    return 'Twelve Data rate-limited this app. Your plan allows a limited number of requests per minute, so wait briefly before refreshing again.'
   }
 
-  if (message.includes('403') || message.includes('401') || message.includes('403 Forbidden')) {
-    return 'FMP rejected the request. Verify that FMP_API_KEY on Render is valid and that the key has access to the quote endpoints used by this app.'
+  if (message.includes('401') || message.includes('403')) {
+    return 'Twelve Data rejected the request. Verify that TWELVE_DATA_API_KEY on Render is valid and has access to quote and statistics endpoints.'
   }
 
-  return 'Check that FMP_API_KEY is set on Render and that the key has access to FMP quote endpoints.'
+  return 'Check that TWELVE_DATA_API_KEY is set on Render and that the key has access to Twelve Data quote endpoints.'
 }
 
 function parseRange(value) {
@@ -148,8 +188,8 @@ function parseRange(value) {
   }
 
   return {
-    low: numberOrNull(match[1].replaceAll(',', '')),
-    high: numberOrNull(match[2].replaceAll(',', '')),
+    low: numberOrNull(match[1]),
+    high: numberOrNull(match[2]),
   }
 }
 
@@ -166,12 +206,7 @@ function formatDisplayTimestamp(date) {
 }
 
 function getApiKey() {
-  return (
-    process.env.FMP_API_KEY ||
-    process.env.FINANCIAL_MODELING_PREP_API_KEY ||
-    process.env.FINANCIALMODELINGPREP_API_KEY ||
-    null
-  )
+  return process.env.TWELVE_DATA_API_KEY || process.env.TWELVE_DATA_KEY || null
 }
 
 async function readConfiguredSymbols() {
@@ -212,40 +247,80 @@ function positionPercent(stock) {
   return ((stock.currentPrice - stock.week52Low) / (stock.week52High - stock.week52Low)) * 100
 }
 
-function normalizeQuote(symbol, quote) {
-  const range = parseRange(quote?.range)
+function normalizeFundamentals(statsPayload) {
+  const statistics = statsPayload?.statistics || statsPayload
+  const valuations = statistics?.valuations_metrics || statistics?.valuations || statistics
+  const financials = statistics?.financials || {}
+  const incomeStatement = financials?.income_statement || statistics?.income_statement || {}
+  const earningsPerShare = statistics?.earnings_per_share || {}
+
+  return {
+    symbol:
+      readString(statsPayload?.meta?.symbol) ||
+      readString(statsPayload?.symbol) ||
+      null,
+    name:
+      readString(statsPayload?.meta?.name) ||
+      readString(statsPayload?.name) ||
+      null,
+    exchange:
+      readString(statsPayload?.meta?.exchange) ||
+      readString(statsPayload?.exchange) ||
+      null,
+    marketCap: firstNumber(
+      valuations?.market_capitalization,
+      statistics?.market_capitalization,
+      statsPayload?.market_capitalization,
+    ),
+    eps: firstNumber(
+      incomeStatement?.diluted_eps_ttm,
+      incomeStatement?.eps_ttm,
+      earningsPerShare?.diluted_eps,
+      earningsPerShare?.basic_eps,
+      statistics?.diluted_eps_ttm,
+      statsPayload?.diluted_eps_ttm,
+    ),
+  }
+}
+
+function normalizeQuote(symbol, quote, fundamentals) {
+  const quoteRange = parseRange(quote?.fifty_two_week?.range || quote?.range)
   const currentPrice = firstNumber(
     quote?.price,
-    quote?.currentPrice,
-    quote?.lastPrice,
-    quote?.regularMarketPrice,
+    quote?.close,
+    quote?.last,
+    quote?.last_price,
+    quote?.extended_price,
   )
   const week52Low = firstNumber(
+    quote?.fifty_two_week?.low,
+    quote?.fifty_two_week?.low_price,
     quote?.yearLow,
     quote?.week52Low,
-    quote?.low52Week,
-    quote?.fiftyTwoWeekLow,
-    range.low,
+    quoteRange.low,
   )
   const week52High = firstNumber(
+    quote?.fifty_two_week?.high,
+    quote?.fifty_two_week?.high_price,
     quote?.yearHigh,
     quote?.week52High,
-    quote?.high52Week,
-    quote?.fiftyTwoWeekHigh,
-    range.high,
+    quoteRange.high,
   )
-  const marketCap = firstNumber(quote?.marketCap, quote?.market_cap, quote?.mktCap)
+  const marketCap = firstNumber(
+    quote?.market_capitalization,
+    quote?.marketCap,
+    fundamentals?.marketCap,
+  )
   const eps = firstNumber(
     quote?.eps,
-    quote?.epsTTM,
-    quote?.epsTrailingTwelveMonths,
-    quote?.trailingEps,
+    quote?.eps_ttm,
+    quote?.trailing_eps,
+    fundamentals?.eps,
   )
   const name =
     readString(quote?.name) ||
     readString(quote?.companyName) ||
-    readString(quote?.shortName) ||
-    readString(quote?.longName) ||
+    readString(fundamentals?.name) ||
     symbol
 
   const normalized = {
@@ -258,8 +333,8 @@ function normalizeQuote(symbol, quote) {
     week52High,
     exchange:
       readString(quote?.exchange) ||
-      readString(quote?.exchangeShortName) ||
-      readString(quote?.fullExchangeName),
+      readString(quote?.mic_code) ||
+      readString(fundamentals?.exchange),
   }
 
   const percent = positionPercent(normalized)
@@ -288,44 +363,41 @@ function sortByHighProximity(stocks) {
   })
 }
 
-function fmpErrorMessage(body, fallback) {
-  if (body && typeof body === 'object' && !Array.isArray(body)) {
-    return (
-      readString(body['Error Message']) ||
-      readString(body.message) ||
-      readString(body.error) ||
-      readString(body.Information) ||
-      fallback
-    )
+function twelveDataErrorMessage(body, fallback) {
+  if (!body || typeof body !== 'object') {
+    return fallback
   }
 
-  return fallback
+  return readString(body.message) || readString(body.status) || fallback
 }
 
-async function fetchFmpJson(url, apiKey, label) {
+async function fetchTwelveDataJson(url, apiKey, label) {
   const response = await fetch(url, {
     headers: {
+      Authorization: `apikey ${apiKey}`,
       'user-agent': 'nima-stock-tracker/1.0',
+      accept: 'application/json',
     },
   })
   const bodyText = await response.text()
-  const safeBodyText = bodyText.replaceAll(apiKey, '[redacted]')
 
   let body = null
   try {
     body = bodyText ? JSON.parse(bodyText) : null
   } catch {
-    throw new Error(`${label} returned non-JSON data: ${safeBodyText.slice(0, 160)}`)
+    throw new Error(`${label} returned non-JSON data: ${bodyText.slice(0, 160)}`)
   }
 
   if (!response.ok) {
     throw new Error(
-      `${label} returned ${response.status}: ${fmpErrorMessage(body, safeBodyText.slice(0, 160))}`,
+      `${label} returned ${response.status}: ${twelveDataErrorMessage(body, bodyText.slice(0, 160))}`,
     )
   }
 
-  if (!Array.isArray(body)) {
-    throw new Error(`${label} rejected the request: ${fmpErrorMessage(body, 'unexpected response')}`)
+  if (body?.status === 'error') {
+    throw new Error(
+      `${label} returned ${body.code || 'error'}: ${twelveDataErrorMessage(body, 'unexpected response')}`,
+    )
   }
 
   return body
@@ -362,339 +434,101 @@ function summarizeFailures(label, failures) {
   return `${failures.length} ${label} request${failures.length === 1 ? '' : 's'} failed (${examples}).`
 }
 
-function quoteForSymbol(symbol, quotes) {
-  return (
-    quotes.find((quote) => readString(quote?.symbol)?.toUpperCase() === symbol) ||
-    quotes[0] ||
-    null
-  )
-}
+function extractBatchQuotes(symbols, body) {
+  const quotesBySymbol = new Map()
 
-async function fetchStableQuote(symbol, apiKey) {
-  const url = new URL('https://financialmodelingprep.com/stable/quote')
-  url.searchParams.set('symbol', symbol)
-  url.searchParams.set('apikey', apiKey)
-
-  const quotes = await fetchFmpJson(url, apiKey, `FMP stable quote ${symbol}`)
-  const quote = quoteForSymbol(symbol, quotes)
-
-  if (!quote) {
-    throw new Error('FMP stable quote returned no records')
-  }
-
-  return quote
-}
-
-async function fetchBatchQuote(symbols, apiKey) {
-  if (!symbols.length) {
-    return []
-  }
-
-  const url = new URL('https://financialmodelingprep.com/stable/batch-quote')
-  url.searchParams.set('symbols', symbols.join(','))
-  url.searchParams.set('apikey', apiKey)
-
-  return fetchFmpJson(url, apiKey, `FMP batch quote (${symbols.length} symbols)`)
-}
-
-async function fetchStableMetrics(symbol, apiKey) {
-  const url = new URL('https://financialmodelingprep.com/stable/key-metrics-ttm')
-  url.searchParams.set('symbol', symbol)
-  url.searchParams.set('apikey', apiKey)
-
-  const metrics = await fetchFmpJson(url, apiKey, `FMP stable key metrics TTM ${symbol}`)
-
-  return quoteForSymbol(symbol, metrics)
-}
-
-async function fetchStableProfile(symbol, apiKey) {
-  const url = new URL('https://financialmodelingprep.com/stable/profile')
-  url.searchParams.set('symbol', symbol)
-  url.searchParams.set('apikey', apiKey)
-
-  const profiles = await fetchFmpJson(url, apiKey, `FMP stable profile ${symbol}`)
-  const profile = quoteForSymbol(symbol, profiles)
-
-  if (!profile) {
-    throw new Error('FMP stable profile returned no records')
-  }
-
-  return profile
-}
-
-async function fetchYahooQuotes(symbols) {
-  if (!symbols.length) {
-    return []
-  }
-
-  const url = new URL('https://query1.finance.yahoo.com/v7/finance/quote')
-  url.searchParams.set('symbols', symbols.join(','))
-
-  const response = await fetch(url, {
-    headers: {
-      accept: 'application/json',
-      'user-agent': 'nima-stock-tracker/1.0',
-    },
-  })
-  const bodyText = await response.text()
-
-  if (!response.ok) {
-    throw new Error(`Yahoo Finance returned ${response.status}: ${bodyText.slice(0, 160)}`)
-  }
-
-  let body = null
-  try {
-    body = JSON.parse(bodyText)
-  } catch {
-    throw new Error(`Yahoo Finance returned non-JSON data: ${bodyText.slice(0, 160)}`)
-  }
-
-  const quotes = body?.quoteResponse?.result
-
-  if (!Array.isArray(quotes)) {
-    const message = readString(body?.quoteResponse?.error?.description) || 'unexpected response'
-    throw new Error(`Yahoo Finance rejected the request: ${message}`)
-  }
-
-  return quotes
-}
-
-async function fetchQuotesFromFmp(symbols, apiKey) {
-  const concurrency = parsePositiveInt(process.env.FMP_CONCURRENCY, 4)
-  const profileFallbackLimit = parsePositiveInt(process.env.FMP_PROFILE_FALLBACK_LIMIT, 4)
-  const quoteFailures = []
-  let successfulQuotes = []
-  let profileSymbols = []
-
-  try {
-    const batchQuotes = await fetchBatchQuote(symbols, apiKey)
-    const batchQuotesBySymbol = new Map(
-      batchQuotes
-        .filter((quote) => readString(quote?.symbol))
-        .map((quote) => [quote.symbol.trim().toUpperCase(), quote]),
-    )
-
-    successfulQuotes = symbols
-      .map((symbol) => {
-        const quote = batchQuotesBySymbol.get(symbol)
-
-        if (!quote) {
-          quoteFailures.push({
-            symbol,
-            error: 'FMP batch quote returned no record',
-          })
-          return null
-        }
-
-        return {
-          symbol,
-          quote,
-          source: 'FMP',
-        }
-      })
-      .filter(Boolean)
-
-    const unresolvedBatchSymbols = symbols.filter((symbol) => !batchQuotesBySymbol.has(symbol))
-    profileSymbols =
-      unresolvedBatchSymbols.length <= profileFallbackLimit ? unresolvedBatchSymbols : []
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown FMP batch quote error'
-
-    for (const symbol of symbols) {
-      quoteFailures.push({
-        symbol,
-        error: message,
-      })
-    }
-  }
-
-  let profileFailures = []
-  let profileQuotes = []
-
-  if (profileSymbols.length) {
-    const profileResults = await mapWithConcurrency(profileSymbols, concurrency, async (symbol) => {
-      try {
-        return {
-          symbol,
-          quote: await fetchStableProfile(symbol, apiKey),
-          error: null,
-        }
-      } catch (error) {
-        return {
-          symbol,
-          quote: null,
-          error: error instanceof Error ? error.message : 'Unknown FMP profile error',
-        }
-      }
-    })
-
-    profileFailures = profileResults.filter((result) => result.error)
-    profileQuotes = profileResults
-      .filter((result) => result.quote)
-      .map(({ symbol, quote }) => ({
-        symbol,
-        quote,
-        source: 'FMP profile',
-      }))
-  }
-
-  const profileResolvedSymbols = new Set(profileQuotes.map((result) => result.symbol))
-  const fallbackSymbols = quoteFailures
-    .map((result) => result.symbol)
-    .filter((symbol) => !profileResolvedSymbols.has(symbol))
-  const fallbackFailures = []
-  let fallbackQuotes = []
-
-  if (fallbackSymbols.length) {
-    try {
-      const yahooQuotes = await fetchYahooQuotes(fallbackSymbols)
-      const yahooQuoteBySymbol = new Map(
-        yahooQuotes
-          .filter((quote) => readString(quote?.symbol))
-          .map((quote) => [quote.symbol.trim().toUpperCase(), quote]),
-      )
-
-      fallbackQuotes = fallbackSymbols
-        .map((symbol) => ({
-          symbol,
-          quote: yahooQuoteBySymbol.get(symbol) || null,
-          source: 'Yahoo Finance',
-        }))
-        .filter((result) => result.quote)
-
-      const fallbackQuoteSymbols = new Set(fallbackQuotes.map((result) => result.symbol))
-
-      for (const symbol of fallbackSymbols) {
-        if (!fallbackQuoteSymbols.has(symbol)) {
-          fallbackFailures.push({
-            symbol,
-            error: 'Yahoo Finance returned no quote record',
-          })
-        }
-      }
-    } catch (error) {
-      for (const symbol of fallbackSymbols) {
-        fallbackFailures.push({
-          symbol,
-          error: error instanceof Error ? error.message : 'Unknown Yahoo Finance fallback error',
-        })
-      }
-    }
-  }
-
-  const allSuccessfulQuotes = [...successfulQuotes, ...profileQuotes, ...fallbackQuotes]
-
-  if (!allSuccessfulQuotes.length) {
-    throw new Error(
-      `No quote provider returned data. ${summarizeFailures('FMP quote', quoteFailures)} ${
-        summarizeFailures('FMP profile', profileFailures) || ''
-      } ${
-        summarizeFailures('Yahoo fallback', fallbackFailures) || ''
-      }`,
-    )
-  }
-
-  const symbolsNeedingEps = allSuccessfulQuotes
-    .filter((result) => firstNumber(result.quote?.eps, result.quote?.epsTTM) === null)
-    .filter((result) => result.source === 'FMP')
-    .map((result) => result.symbol)
-  const metricsBySymbol = new Map()
-  let metricsFailures = []
-
-  if (symbolsNeedingEps.length) {
-    const metricResults = await mapWithConcurrency(symbolsNeedingEps, concurrency, async (symbol) => {
-      try {
-        return {
-          symbol,
-          metrics: await fetchStableMetrics(symbol, apiKey),
-          error: null,
-        }
-      } catch (error) {
-        return {
-          symbol,
-          metrics: null,
-          error: error instanceof Error ? error.message : 'Unknown FMP metrics error',
-        }
-      }
-    })
-
-    for (const result of metricResults) {
-      if (result.metrics) {
-        metricsBySymbol.set(result.symbol, result.metrics)
-      }
+  const pushQuote = (candidate, fallbackSymbol = null) => {
+    if (!candidate || typeof candidate !== 'object') {
+      return
     }
 
-    metricsFailures = metricResults.filter((result) => result.error)
-  }
+    const nested = candidate.data && typeof candidate.data === 'object' ? candidate.data : candidate
+    const symbol =
+      readString(nested?.symbol)?.toUpperCase() ||
+      readString(fallbackSymbol)?.toUpperCase() ||
+      null
 
-  const quotes = allSuccessfulQuotes.map(({ symbol, quote }) => {
-    const metrics = metricsBySymbol.get(symbol)
-    const eps = firstNumber(
-      quote?.eps,
-      quote?.epsTTM,
-      quote?.epsTrailingTwelveMonths,
-      quote?.trailingEps,
-      metrics?.netIncomePerShareTTM,
-      metrics?.epsTTM,
-      metrics?.eps,
-    )
+    if (!symbol) {
+      return
+    }
 
-    return {
-      ...quote,
+    quotesBySymbol.set(symbol, {
+      ...nested,
       symbol,
-      eps,
+    })
+  }
+
+  if (Array.isArray(body)) {
+    for (const quote of body) {
+      pushQuote(quote)
     }
-  })
-  const fmpSuccessCount = successfulQuotes.length
-  const profileSuccessCount = profileQuotes.length
-  const fallbackSuccessCount = fallbackQuotes.length
-  const profileMessage =
-    profileSuccessCount > 0
-      ? `${profileSuccessCount} symbol${
-          profileSuccessCount === 1 ? '' : 's'
-        } were blocked by FMP quote and filled with FMP profile data.`
-      : null
-  const fallbackMessage =
-    fallbackSuccessCount > 0
-      ? `${fallbackSuccessCount} symbol${
-          fallbackSuccessCount === 1 ? '' : 's'
-        } were blocked by FMP and filled with Yahoo Finance fallback.`
-      : null
-  const fallbackResolvedSymbols = new Set(fallbackQuotes.map((result) => result.symbol))
-  const unresolvedFmpFailures = quoteFailures.filter(
-    (failure) =>
-      !profileResolvedSymbols.has(failure.symbol) && !fallbackResolvedSymbols.has(failure.symbol),
-  )
-  const unresolvedProfileFailures = profileFailures.filter(
-    (failure) => !fallbackResolvedSymbols.has(failure.symbol),
-  )
 
-  const warning = [
-    profileMessage,
-    fallbackMessage,
-    summarizeFailures('FMP quote', unresolvedFmpFailures),
-    summarizeFailures('FMP profile', unresolvedProfileFailures),
-    summarizeFailures('Yahoo fallback', fallbackFailures),
-    summarizeFailures('EPS metrics', metricsFailures),
-  ]
-    .filter(Boolean)
-    .join(' ')
+    return quotesBySymbol
+  }
 
-  return {
-    quotes,
-    source:
-      [
-        fmpSuccessCount ? 'FMP batch quote' : null,
-        profileSuccessCount ? 'FMP stable profile' : null,
-        fallbackSuccessCount ? 'Yahoo fallback' : null,
-      ]
-        .filter(Boolean)
-        .join(' + ') || 'FMP batch quote',
-    warning: warning || null,
+  if (!body || typeof body !== 'object') {
+    return quotesBySymbol
+  }
+
+  if (body.status === 'ok' && body.data) {
+    return extractBatchQuotes(symbols, body.data)
+  }
+
+  for (const [key, value] of Object.entries(body)) {
+    if (key === 'status' || key === 'code' || key === 'message') {
+      continue
+    }
+
+    const fallbackSymbol = symbols.includes(key.toUpperCase()) ? key : null
+    pushQuote(value, fallbackSymbol)
+  }
+
+  return quotesBySymbol
+}
+
+async function fetchBatchQuotes(symbols, apiKey) {
+  if (!symbols.length) {
+    return new Map()
+  }
+
+  const url = new URL('https://api.twelvedata.com/quote')
+  url.searchParams.set('symbol', symbols.join(','))
+
+  const body = await fetchTwelveDataJson(url, apiKey, `Twelve Data quote batch (${symbols.length} symbols)`)
+  return extractBatchQuotes(symbols, body)
+}
+
+async function fetchStatistics(symbol, apiKey) {
+  const url = new URL('https://api.twelvedata.com/statistics')
+  url.searchParams.set('symbol', symbol)
+
+  return fetchTwelveDataJson(url, apiKey, `Twelve Data statistics ${symbol}`)
+}
+
+function loadPersistedCachesIfNeeded(symbolsKey, persistedCache) {
+  if (!persistedCache || persistedCache.symbolsKey !== symbolsKey) {
+    return
+  }
+
+  if (!stockCache.payload && persistedCache.payload) {
+    stockCache = {
+      symbolsKey,
+      expiresAt: 0,
+      fetchedAt: 0,
+      payload: persistedCache.payload,
+    }
+  }
+
+  if (!fundamentalsCache.bySymbol.size && persistedCache.fundamentalsBySymbol.size) {
+    fundamentalsCache = {
+      symbolsKey,
+      fetchedAt: persistedCache.fundamentalsFetchedAt || 0,
+      bySymbol: persistedCache.fundamentalsBySymbol,
+    }
   }
 }
 
-async function fetchFmpQuotes(symbols) {
+async function fetchTwelveDataStocks(symbols) {
   const apiKey = getApiKey()
   const now = new Date()
 
@@ -703,36 +537,113 @@ async function fetchFmpQuotes(symbols) {
       updatedAt: now.toISOString(),
       updatedLabel: formatDisplayTimestamp(now),
       source: null,
-      warning: 'Missing FMP_API_KEY. Add it as an environment variable on Render.',
-      stocks: symbols.map((symbol) => normalizeQuote(symbol, null)),
+      warning: 'Missing TWELVE_DATA_API_KEY. Add it as an environment variable on Render.',
+      stocks: symbols.map((symbol) => normalizeQuote(symbol, null, null)),
     }
   }
 
-  const { quotes, source, warning: fetchWarning } = await fetchQuotesFromFmp(symbols, apiKey)
+  const quotesBySymbol = await fetchBatchQuotes(symbols, apiKey)
 
-  const quoteBySymbol = new Map(
-    quotes
-      .filter((quote) => readString(quote?.symbol))
-      .map((quote) => [quote.symbol.trim().toUpperCase(), quote]),
+  if (!quotesBySymbol.size) {
+    throw new Error('No Twelve Data quotes were returned.')
+  }
+
+  const nowMs = now.getTime()
+  const needFundamentalsRefresh =
+    fundamentalsCache.symbolsKey !== symbols.join(',') ||
+    !fundamentalsCache.bySymbol.size ||
+    nowMs - fundamentalsCache.fetchedAt >= fundamentalsCacheTtlMs
+
+  const symbolsMissingFundamentals = symbols.filter((symbol) => {
+    const cached = fundamentalsCache.bySymbol.get(symbol)
+    return !cached || (cached.eps === null && cached.marketCap === null)
+  })
+
+  const symbolsForStatistics = needFundamentalsRefresh ? symbols : symbolsMissingFundamentals
+  const statisticsFailures = []
+  const nextFundamentalsBySymbol =
+    fundamentalsCache.symbolsKey === symbols.join(',')
+      ? new Map(fundamentalsCache.bySymbol)
+      : new Map()
+
+  if (symbolsForStatistics.length) {
+    const statisticResults = await mapWithConcurrency(
+      symbolsForStatistics,
+      statsConcurrency,
+      async (symbol) => {
+        try {
+          return {
+            symbol,
+            fundamentals: normalizeFundamentals(await fetchStatistics(symbol, apiKey)),
+            error: null,
+          }
+        } catch (error) {
+          return {
+            symbol,
+            fundamentals: null,
+            error: error instanceof Error ? error.message : 'Unknown Twelve Data statistics error',
+          }
+        }
+      },
+    )
+
+    for (const result of statisticResults) {
+      if (result.fundamentals) {
+        nextFundamentalsBySymbol.set(result.symbol, result.fundamentals)
+      } else if (result.error) {
+        statisticsFailures.push({
+          symbol: result.symbol,
+          error: result.error,
+        })
+      }
+    }
+
+    if (statisticResults.some((result) => result.fundamentals)) {
+      fundamentalsCache = {
+        symbolsKey: symbols.join(','),
+        fetchedAt: nowMs,
+        bySymbol: nextFundamentalsBySymbol,
+      }
+    }
+  }
+
+  const stocks = symbols.map((symbol) =>
+    normalizeQuote(symbol, quotesBySymbol.get(symbol) || null, nextFundamentalsBySymbol.get(symbol) || null),
   )
 
-  const stocks = symbols.map((symbol) => normalizeQuote(symbol, quoteBySymbol.get(symbol)))
+  const missingQuoteSymbols = symbols.filter((symbol) => !quotesBySymbol.has(symbol))
   const incompleteSymbols = stocks
-    .filter((stock) => stock.currentPrice === null)
+    .filter(
+      (stock) =>
+        stock.currentPrice === null || stock.week52Low === null || stock.week52High === null,
+    )
     .map((stock) => stock.symbol)
-  const incompleteWarning = incompleteSymbols.length
-    ? `${incompleteSymbols.length} configured symbol${
-        incompleteSymbols.length === 1 ? '' : 's'
-      } did not return complete quote data: ${incompleteSymbols.slice(0, 8).join(', ')}${
-        incompleteSymbols.length > 8 ? ', ...' : ''
-      }.`
-    : null
+
+  const warning = [
+    missingQuoteSymbols.length
+      ? `${missingQuoteSymbols.length} configured symbol${
+          missingQuoteSymbols.length === 1 ? '' : 's'
+        } did not return a Twelve Data quote: ${missingQuoteSymbols.slice(0, 8).join(', ')}${
+          missingQuoteSymbols.length > 8 ? ', ...' : ''
+        }.`
+      : null,
+    summarizeFailures('Twelve Data statistics', statisticsFailures),
+    incompleteSymbols.length
+      ? `${incompleteSymbols.length} configured symbol${
+          incompleteSymbols.length === 1 ? '' : 's'
+        } did not return complete quote data: ${incompleteSymbols.slice(0, 8).join(', ')}${
+          incompleteSymbols.length > 8 ? ', ...' : ''
+        }.`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' ')
 
   return {
     updatedAt: now.toISOString(),
     updatedLabel: formatDisplayTimestamp(now),
-    source,
-    warning: [fetchWarning, incompleteWarning].filter(Boolean).join(' ') || null,
+    source: 'Twelve Data quote + statistics',
+    warning: warning || null,
     stocks: sortByHighProximity(stocks),
   }
 }
@@ -741,22 +652,33 @@ async function buildStocksPayload({ force = false } = {}) {
   const symbols = await readConfiguredSymbols()
   const symbolsKey = symbols.join(',')
   const now = Date.now()
+  const persistedCache = await readPersistedCache()
+
+  loadPersistedCachesIfNeeded(symbolsKey, persistedCache)
 
   if (!force && stockCache.payload && stockCache.symbolsKey === symbolsKey && stockCache.expiresAt > now) {
     return {
       ...stockCache.payload,
       cached: true,
+      stale: false,
     }
   }
 
   try {
-    const payload = await fetchFmpQuotes(symbols)
+    const payload = await fetchTwelveDataStocks(symbols)
     stockCache = {
       symbolsKey,
-      expiresAt: now + cacheTtlMs,
+      expiresAt: now + quoteCacheTtlMs,
+      fetchedAt: now,
       payload,
     }
-    await writePersistedCache(symbolsKey, payload)
+
+    await writePersistedCache(
+      symbolsKey,
+      payload,
+      fundamentalsCache.bySymbol,
+      fundamentalsCache.fetchedAt,
+    )
 
     return {
       ...payload,
@@ -767,7 +689,6 @@ async function buildStocksPayload({ force = false } = {}) {
     const fallbackDetail = `Showing cached stock data because the live refresh failed: ${
       error instanceof Error ? error.message : 'Unknown stock data error.'
     }`
-    const persistedCache = await readPersistedCache()
     const fallbackPayload =
       stockCache.payload && stockCache.symbolsKey === symbolsKey
         ? stockCache.payload
@@ -778,7 +699,8 @@ async function buildStocksPayload({ force = false } = {}) {
     if (fallbackPayload) {
       stockCache = {
         symbolsKey,
-        expiresAt: now + cacheTtlMs,
+        expiresAt: now + quoteCacheTtlMs,
+        fetchedAt: now,
         payload: fallbackPayload,
       }
 

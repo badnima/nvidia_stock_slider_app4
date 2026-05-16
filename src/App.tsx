@@ -116,7 +116,7 @@ function App() {
       <header className="page-header">
         <div className="header-inner">
           <div>
-            <p className="eyebrow">FMP Market View</p>
+            <p className="eyebrow">Twelve Data Market View</p>
             <h1>52-Week Stock Position</h1>
             <p className="updated-at">
               {payload?.updatedLabel ? `Latest refresh: ${payload.updatedLabel}` : 'Loading market data...'}
@@ -141,7 +141,7 @@ function App() {
         <div className="status-strip">
           <span>
             <Server size={16} />
-            {payload?.source ? `${payload.source} loaded server-side` : 'FMP data loaded server-side'}
+            {payload?.source ? `${payload.source} loaded server-side` : 'Twelve Data loaded server-side'}
           </span>
           <span>
             <TrendingUp size={16} />
