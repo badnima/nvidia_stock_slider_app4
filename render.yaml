@@ -14,10 +14,19 @@ services:
       - key: FMP_API_KEY
         sync: false
       - key: RENDER_KEY_VALUE_URL
-        sync: false
+        fromService:
+          name: nima-stock-tracker-cache
+          type: keyvalue
+          property: connectionString
       - key: TWELVE_DATA_QUOTE_CACHE_SECONDS
         value: "300"
       - key: FMP_MARKET_CAP_CACHE_SECONDS
         value: "86400"
       - key: TWELVE_DATA_EARNINGS_REFRESH_LIMIT
         value: "1"
+
+  - type: keyvalue
+    name: nima-stock-tracker-cache
+    plan: starter
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []

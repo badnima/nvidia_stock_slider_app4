@@ -45,7 +45,7 @@ Set this Render environment variable:
 
 - `TWELVE_DATA_API_KEY`: your Twelve Data API key
 - `FMP_API_KEY`: your Financial Modeling Prep API key for Market Cap
-- `RENDER_KEY_VALUE_URL`: the internal connection string for your Render Key Value instance
+- `RENDER_KEY_VALUE_URL`: automatically populated from the Render Key Value service in `render.yaml`
 
 Optional:
 
@@ -63,6 +63,12 @@ Optional:
 - Market cap is cached daily and EPS is cached after it is first retrieved, so normal refreshes stay cheap
 
 This means the first warm-up after deploy may cost more API calls than later refreshes, but regular usage stays much cheaper.
+
+## Render Key Value
+
+- `render.yaml` now provisions a Render Key Value instance named `nima-stock-tracker-cache`
+- The web service receives its internal Redis connection string automatically through `fromService`
+- The Key Value service is set to `starter` because free Render Key Value instances do not persist data to disk
 
 ## Troubleshooting Live Data
 
