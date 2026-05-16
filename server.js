@@ -21,6 +21,8 @@ const quoteCacheTtlMs =
 const fundamentalsCacheTtlMs =
   parsePositiveInt(process.env.TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS, 86400) * 1000
 const statsConcurrency = parsePositiveInt(process.env.TWELVE_DATA_STATS_CONCURRENCY, 4)
+const statisticsRefreshLimit = parsePositiveInt(process.env.TWELVE_DATA_STATISTICS_REFRESH_LIMIT, 1)
+const earningsRefreshLimit = parsePositiveInt(process.env.TWELVE_DATA_EARNINGS_REFRESH_LIMIT, 1)
 
 let stockCache = {
   symbolsKey: '',
@@ -170,6 +172,10 @@ function buildErrorHint(error) {
   return 'Check that TWELVE_DATA_API_KEY is set on Render and that the key has access to Twelve Data quote endpoints.'
 }
 
+function isPlanRestrictedMessage(message) {
+  return typeof message === 'string' && message.includes('available exclusively')
+}
+
 function parseRange(value) {
   const range = readString(value)
   if (!range) {
@@ -281,6 +287,21 @@ function normalizeFundamentals(statsPayload) {
       statsPayload?.diluted_eps_ttm,
     ),
   }
+}
+
+function extractLatestReportedEps(earningsPayload) {
+  if (!Array.isArray(earningsPayload?.earnings)) {
+    return null
+  }
+
+  for (const entry of earningsPayload.earnings) {
+    const actual = numberOrNull(entry?.eps_actual)
+    if (actual !== null) {
+      return actual
+    }
+  }
+
+  return null
 }
 
 function normalizeQuote(symbol, quote, fundamentals) {
@@ -505,6 +526,13 @@ async function fetchStatistics(symbol, apiKey) {
   return fetchTwelveDataJson(url, apiKey, `Twelve Data statistics ${symbol}`)
 }
 
+async function fetchEarnings(symbol, apiKey) {
+  const url = new URL('https://api.twelvedata.com/earnings')
+  url.searchParams.set('symbol', symbol)
+
+  return fetchTwelveDataJson(url, apiKey, `Twelve Data earnings ${symbol}`)
+}
+
 function loadPersistedCachesIfNeeded(symbolsKey, persistedCache) {
   if (!persistedCache || persistedCache.symbolsKey !== symbolsKey) {
     return
@@ -559,8 +587,12 @@ async function fetchTwelveDataStocks(symbols) {
     return !cached || (cached.eps === null && cached.marketCap === null)
   })
 
-  const symbolsForStatistics = needFundamentalsRefresh ? symbols : symbolsMissingFundamentals
+  const symbolsForStatistics = (needFundamentalsRefresh ? symbols : symbolsMissingFundamentals).slice(
+    0,
+    statisticsRefreshLimit,
+  )
   const statisticsFailures = []
+  let statisticsPlanRestricted = false
   const nextFundamentalsBySymbol =
     fundamentalsCache.symbolsKey === symbols.join(',')
       ? new Map(fundamentalsCache.bySymbol)
@@ -578,10 +610,12 @@ async function fetchTwelveDataStocks(symbols) {
             error: null,
           }
         } catch (error) {
+          const message =
+            error instanceof Error ? error.message : 'Unknown Twelve Data statistics error'
           return {
             symbol,
             fundamentals: null,
-            error: error instanceof Error ? error.message : 'Unknown Twelve Data statistics error',
+            error: message,
           }
         }
       },
@@ -591,6 +625,9 @@ async function fetchTwelveDataStocks(symbols) {
       if (result.fundamentals) {
         nextFundamentalsBySymbol.set(result.symbol, result.fundamentals)
       } else if (result.error) {
+        if (isPlanRestrictedMessage(result.error)) {
+          statisticsPlanRestricted = true
+        }
         statisticsFailures.push({
           symbol: result.symbol,
           error: result.error,
@@ -607,11 +644,76 @@ async function fetchTwelveDataStocks(symbols) {
     }
   }
 
+  const symbolsForEarnings = symbols
+    .filter((symbol) => {
+      const cached = nextFundamentalsBySymbol.get(symbol)
+      return !cached || cached.eps === null
+    })
+    .slice(0, earningsRefreshLimit)
+  const earningsFailures = []
+
+  if (symbolsForEarnings.length) {
+    const earningResults = await mapWithConcurrency(
+      symbolsForEarnings,
+      1,
+      async (symbol) => {
+        try {
+          return {
+            symbol,
+            eps: extractLatestReportedEps(await fetchEarnings(symbol, apiKey)),
+            error: null,
+          }
+        } catch (error) {
+          return {
+            symbol,
+            eps: null,
+            error: error instanceof Error ? error.message : 'Unknown Twelve Data earnings error',
+          }
+        }
+      },
+    )
+
+    let updatedFromEarnings = false
+
+    for (const result of earningResults) {
+      if (result.eps !== null) {
+        const cached = nextFundamentalsBySymbol.get(result.symbol) || {
+          symbol: result.symbol,
+          name: quotesBySymbol.get(result.symbol)?.name || null,
+          exchange: quotesBySymbol.get(result.symbol)?.exchange || null,
+          marketCap: null,
+          eps: null,
+        }
+
+        nextFundamentalsBySymbol.set(result.symbol, {
+          ...cached,
+          eps: result.eps,
+        })
+        updatedFromEarnings = true
+      } else if (result.error) {
+        earningsFailures.push({
+          symbol: result.symbol,
+          error: result.error,
+        })
+      }
+    }
+
+    if (updatedFromEarnings) {
+      fundamentalsCache = {
+        symbolsKey: symbols.join(','),
+        fetchedAt: nowMs,
+        bySymbol: nextFundamentalsBySymbol,
+      }
+    }
+  }
+
   const stocks = symbols.map((symbol) =>
     normalizeQuote(symbol, quotesBySymbol.get(symbol) || null, nextFundamentalsBySymbol.get(symbol) || null),
   )
 
   const missingQuoteSymbols = symbols.filter((symbol) => !quotesBySymbol.has(symbol))
+  const missingMarketCapSymbols = stocks.filter((stock) => stock.marketCap === null).map((stock) => stock.symbol)
+  const missingEpsSymbols = stocks.filter((stock) => stock.eps === null).map((stock) => stock.symbol)
   const incompleteSymbols = stocks
     .filter(
       (stock) =>
@@ -627,7 +729,20 @@ async function fetchTwelveDataStocks(symbols) {
           missingQuoteSymbols.length > 8 ? ', ...' : ''
         }.`
       : null,
-    summarizeFailures('Twelve Data statistics', statisticsFailures),
+    statisticsPlanRestricted
+      ? 'Twelve Data statistics is not included for most configured symbols on the current plan, so market cap may show as N/A.'
+      : summarizeFailures('Twelve Data statistics', statisticsFailures),
+    summarizeFailures('Twelve Data earnings', earningsFailures),
+    missingEpsSymbols.length
+      ? `${missingEpsSymbols.length} configured symbol${
+          missingEpsSymbols.length === 1 ? '' : 's'
+        } still do not have EPS data cached.`
+      : null,
+    missingMarketCapSymbols.length
+      ? `${missingMarketCapSymbols.length} configured symbol${
+          missingMarketCapSymbols.length === 1 ? '' : 's'
+        } do not have market cap data available under the current Twelve Data access level.`
+      : null,
     incompleteSymbols.length
       ? `${incompleteSymbols.length} configured symbol${
           incompleteSymbols.length === 1 ? '' : 's'

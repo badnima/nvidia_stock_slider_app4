@@ -48,12 +48,15 @@ Optional:
 - `TWELVE_DATA_QUOTE_CACHE_SECONDS`: quote payload cache TTL. Default is `300`
 - `TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS`: EPS and market-cap cache TTL. Default is `86400`
 - `TWELVE_DATA_STATS_CONCURRENCY`: number of Twelve Data statistics requests to run at once when warming the fundamentals cache. Default is `4`
+- `TWELVE_DATA_STATISTICS_REFRESH_LIMIT`: number of symbols to probe with `/statistics` per refresh. Default is `1`
+- `TWELVE_DATA_EARNINGS_REFRESH_LIMIT`: number of symbols to backfill from `/earnings` per refresh. Default is `1`
 
 ## How The Provider Calls Work
 
 - Quotes are fetched from Twelve Data `/quote`
 - The server requests all configured symbols in one quote batch query
-- EPS and market cap are filled from Twelve Data `/statistics`
+- Market cap is filled from Twelve Data `/statistics` when that endpoint is available for the symbol
+- EPS is filled from `/statistics` when available, otherwise the server falls back to the latest reported value from `/earnings`
 - Fundamentals are cached much longer than quotes so a normal refresh only needs the quote batch call
 
 This means the first warm-up after deploy may cost more API calls than later refreshes, but regular usage stays much cheaper.
@@ -66,3 +69,4 @@ Open `/api/stocks` on the deployed Render URL.
 - If you see a Twelve Data `429` error, the app is being rate-limited by the provider. Wait for the per-minute quota window to reset and try again.
 - If you see a Twelve Data `401` or `403` error, confirm the key is valid and has access to quote and statistics endpoints.
 - If a live refresh fails after at least one successful load, the server will fall back to the last cached payload from `.stock-cache.json`.
+- On your current plan, some symbols do not expose `/statistics` or `/market_cap`, so Market Cap may remain `N/A` even when price data loads successfully.
