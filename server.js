@@ -18,10 +18,11 @@ const quoteCacheTtlMs =
       process.env.FMP_CACHE_TTL_SECONDS,
     300,
   ) * 1000
-const fundamentalsCacheTtlMs =
-  parsePositiveInt(process.env.TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS, 86400) * 1000
-const statsConcurrency = parsePositiveInt(process.env.TWELVE_DATA_STATS_CONCURRENCY, 4)
-const statisticsRefreshLimit = parsePositiveInt(process.env.TWELVE_DATA_STATISTICS_REFRESH_LIMIT, 1)
+const marketCapCacheTtlMs =
+  parsePositiveInt(
+    process.env.FMP_MARKET_CAP_CACHE_SECONDS || process.env.TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS,
+    86400,
+  ) * 1000
 const earningsRefreshLimit = parsePositiveInt(process.env.TWELVE_DATA_EARNINGS_REFRESH_LIMIT, 1)
 
 let stockCache = {
@@ -33,7 +34,7 @@ let stockCache = {
 
 let fundamentalsCache = {
   symbolsKey: '',
-  fetchedAt: 0,
+  marketCapFetchedAt: 0,
   bySymbol: new Map(),
 }
 
@@ -110,7 +111,8 @@ async function readPersistedCache() {
       symbolsKey: readString(parsed.symbolsKey) || '',
       payload: persistedPayload,
       persistedAt: readString(parsed.persistedAt),
-      fundamentalsFetchedAt: numberOrNull(parsed.fundamentalsFetchedAt) || 0,
+      marketCapFetchedAt:
+        numberOrNull(parsed.marketCapFetchedAt) || numberOrNull(parsed.fundamentalsFetchedAt) || 0,
       fundamentalsBySymbol: persistedFundamentals,
     }
   } catch (error) {
@@ -123,7 +125,7 @@ async function readPersistedCache() {
   }
 }
 
-async function writePersistedCache(symbolsKey, payload, bySymbol, fundamentalsFetchedAt) {
+async function writePersistedCache(symbolsKey, payload, bySymbol, marketCapFetchedAt) {
   try {
     await fs.writeFile(
       cacheFile,
@@ -131,7 +133,7 @@ async function writePersistedCache(symbolsKey, payload, bySymbol, fundamentalsFe
         {
           symbolsKey,
           persistedAt: new Date().toISOString(),
-          fundamentalsFetchedAt,
+          marketCapFetchedAt,
           fundamentalsBySymbol: mapToObject(bySymbol),
           payload,
         },
@@ -166,14 +168,10 @@ function buildErrorHint(error) {
   }
 
   if (message.includes('401') || message.includes('403')) {
-    return 'Twelve Data rejected the request. Verify that TWELVE_DATA_API_KEY on Render is valid and has access to quote and statistics endpoints.'
+    return 'Twelve Data rejected the request. Verify that TWELVE_DATA_API_KEY on Render is valid and has access to quote and earnings endpoints.'
   }
 
   return 'Check that TWELVE_DATA_API_KEY is set on Render and that the key has access to Twelve Data quote endpoints.'
-}
-
-function isPlanRestrictedMessage(message) {
-  return typeof message === 'string' && message.includes('available exclusively')
 }
 
 function parseRange(value) {
@@ -211,8 +209,17 @@ function formatDisplayTimestamp(date) {
   }).format(date)
 }
 
-function getApiKey() {
+function getTwelveDataApiKey() {
   return process.env.TWELVE_DATA_API_KEY || process.env.TWELVE_DATA_KEY || null
+}
+
+function getFmpApiKey() {
+  return (
+    process.env.FMP_API_KEY ||
+    process.env.FINANCIAL_MODELING_PREP_API_KEY ||
+    process.env.FINANCIALMODELINGPREP_API_KEY ||
+    null
+  )
 }
 
 async function readConfiguredSymbols() {
@@ -251,42 +258,6 @@ function positionPercent(stock) {
   }
 
   return ((stock.currentPrice - stock.week52Low) / (stock.week52High - stock.week52Low)) * 100
-}
-
-function normalizeFundamentals(statsPayload) {
-  const statistics = statsPayload?.statistics || statsPayload
-  const valuations = statistics?.valuations_metrics || statistics?.valuations || statistics
-  const financials = statistics?.financials || {}
-  const incomeStatement = financials?.income_statement || statistics?.income_statement || {}
-  const earningsPerShare = statistics?.earnings_per_share || {}
-
-  return {
-    symbol:
-      readString(statsPayload?.meta?.symbol) ||
-      readString(statsPayload?.symbol) ||
-      null,
-    name:
-      readString(statsPayload?.meta?.name) ||
-      readString(statsPayload?.name) ||
-      null,
-    exchange:
-      readString(statsPayload?.meta?.exchange) ||
-      readString(statsPayload?.exchange) ||
-      null,
-    marketCap: firstNumber(
-      valuations?.market_capitalization,
-      statistics?.market_capitalization,
-      statsPayload?.market_capitalization,
-    ),
-    eps: firstNumber(
-      incomeStatement?.diluted_eps_ttm,
-      incomeStatement?.eps_ttm,
-      earningsPerShare?.diluted_eps,
-      earningsPerShare?.basic_eps,
-      statistics?.diluted_eps_ttm,
-      statsPayload?.diluted_eps_ttm,
-    ),
-  }
 }
 
 function extractLatestReportedEps(earningsPayload) {
@@ -392,6 +363,20 @@ function twelveDataErrorMessage(body, fallback) {
   return readString(body.message) || readString(body.status) || fallback
 }
 
+function fmpErrorMessage(body, fallback) {
+  if (!body || typeof body !== 'object') {
+    return fallback
+  }
+
+  return (
+    readString(body['Error Message']) ||
+    readString(body.message) ||
+    readString(body.error) ||
+    readString(body.Information) ||
+    fallback
+  )
+}
+
 async function fetchTwelveDataJson(url, apiKey, label) {
   const response = await fetch(url, {
     headers: {
@@ -419,6 +404,33 @@ async function fetchTwelveDataJson(url, apiKey, label) {
     throw new Error(
       `${label} returned ${body.code || 'error'}: ${twelveDataErrorMessage(body, 'unexpected response')}`,
     )
+  }
+
+  return body
+}
+
+async function fetchFmpJson(url, apiKey, label) {
+  const response = await fetch(url, {
+    headers: {
+      'user-agent': 'nima-stock-tracker/1.0',
+      accept: 'application/json',
+    },
+  })
+  const bodyText = await response.text()
+
+  let body = null
+  try {
+    body = bodyText ? JSON.parse(bodyText) : null
+  } catch {
+    throw new Error(`${label} returned non-JSON data: ${bodyText.slice(0, 160)}`)
+  }
+
+  if (!response.ok) {
+    throw new Error(`${label} returned ${response.status}: ${fmpErrorMessage(body, bodyText.slice(0, 160))}`)
+  }
+
+  if (!Array.isArray(body) && (!body || typeof body !== 'object')) {
+    throw new Error(`${label} rejected the request: ${fmpErrorMessage(body, 'unexpected response')}`)
   }
 
   return body
@@ -519,18 +531,52 @@ async function fetchBatchQuotes(symbols, apiKey) {
   return extractBatchQuotes(symbols, body)
 }
 
-async function fetchStatistics(symbol, apiKey) {
-  const url = new URL('https://api.twelvedata.com/statistics')
-  url.searchParams.set('symbol', symbol)
-
-  return fetchTwelveDataJson(url, apiKey, `Twelve Data statistics ${symbol}`)
-}
-
 async function fetchEarnings(symbol, apiKey) {
   const url = new URL('https://api.twelvedata.com/earnings')
   url.searchParams.set('symbol', symbol)
 
   return fetchTwelveDataJson(url, apiKey, `Twelve Data earnings ${symbol}`)
+}
+
+function extractBatchMarketCaps(symbols, body) {
+  const bySymbol = new Map()
+  const rows = Array.isArray(body) ? body : Object.values(body || {})
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') {
+      continue
+    }
+
+    const symbol = readString(row.symbol)?.toUpperCase()
+    const marketCap = firstNumber(
+      row.marketCap,
+      row.market_cap,
+      row.marketCapitalization,
+      row.capitalization,
+      row.value,
+    )
+
+    if (!symbol || marketCap === null || !symbols.includes(symbol)) {
+      continue
+    }
+
+    bySymbol.set(symbol, marketCap)
+  }
+
+  return bySymbol
+}
+
+async function fetchBatchMarketCaps(symbols, apiKey) {
+  if (!symbols.length) {
+    return new Map()
+  }
+
+  const url = new URL('https://financialmodelingprep.com/stable/market-capitalization-batch')
+  url.searchParams.set('symbols', symbols.join(','))
+  url.searchParams.set('apikey', apiKey)
+
+  const body = await fetchFmpJson(url, apiKey, `FMP batch market cap (${symbols.length} symbols)`)
+  return extractBatchMarketCaps(symbols, body)
 }
 
 function loadPersistedCachesIfNeeded(symbolsKey, persistedCache) {
@@ -550,14 +596,15 @@ function loadPersistedCachesIfNeeded(symbolsKey, persistedCache) {
   if (!fundamentalsCache.bySymbol.size && persistedCache.fundamentalsBySymbol.size) {
     fundamentalsCache = {
       symbolsKey,
-      fetchedAt: persistedCache.fundamentalsFetchedAt || 0,
+      marketCapFetchedAt: persistedCache.marketCapFetchedAt || 0,
       bySymbol: persistedCache.fundamentalsBySymbol,
     }
   }
 }
 
 async function fetchTwelveDataStocks(symbols) {
-  const apiKey = getApiKey()
+  const apiKey = getTwelveDataApiKey()
+  const fmpApiKey = getFmpApiKey()
   const now = new Date()
 
   if (!apiKey) {
@@ -577,69 +624,51 @@ async function fetchTwelveDataStocks(symbols) {
   }
 
   const nowMs = now.getTime()
-  const needFundamentalsRefresh =
-    fundamentalsCache.symbolsKey !== symbols.join(',') ||
-    !fundamentalsCache.bySymbol.size ||
-    nowMs - fundamentalsCache.fetchedAt >= fundamentalsCacheTtlMs
-
-  const symbolsMissingFundamentals = symbols.filter((symbol) => {
-    const cached = fundamentalsCache.bySymbol.get(symbol)
-    return !cached || (cached.eps === null && cached.marketCap === null)
-  })
-
-  const symbolsForStatistics = (needFundamentalsRefresh ? symbols : symbolsMissingFundamentals).slice(
-    0,
-    statisticsRefreshLimit,
-  )
-  const statisticsFailures = []
-  let statisticsPlanRestricted = false
   const nextFundamentalsBySymbol =
     fundamentalsCache.symbolsKey === symbols.join(',')
       ? new Map(fundamentalsCache.bySymbol)
       : new Map()
+  const marketCapFailures = []
+  const needMarketCapRefresh =
+    fundamentalsCache.symbolsKey !== symbols.join(',') ||
+    !symbols.every((symbol) => nextFundamentalsBySymbol.get(symbol)?.marketCap !== null) ||
+    nowMs - fundamentalsCache.marketCapFetchedAt >= marketCapCacheTtlMs
 
-  if (symbolsForStatistics.length) {
-    const statisticResults = await mapWithConcurrency(
-      symbolsForStatistics,
-      statsConcurrency,
-      async (symbol) => {
-        try {
-          return {
-            symbol,
-            fundamentals: normalizeFundamentals(await fetchStatistics(symbol, apiKey)),
-            error: null,
-          }
-        } catch (error) {
-          const message =
-            error instanceof Error ? error.message : 'Unknown Twelve Data statistics error'
-          return {
-            symbol,
-            fundamentals: null,
-            error: message,
-          }
-        }
-      },
-    )
+  if (needMarketCapRefresh) {
+    if (!fmpApiKey) {
+      marketCapFailures.push({
+        symbol: 'FMP',
+        error: 'Missing FMP_API_KEY',
+      })
+    } else {
+      try {
+        const marketCapsBySymbol = await fetchBatchMarketCaps(symbols, fmpApiKey)
 
-    for (const result of statisticResults) {
-      if (result.fundamentals) {
-        nextFundamentalsBySymbol.set(result.symbol, result.fundamentals)
-      } else if (result.error) {
-        if (isPlanRestrictedMessage(result.error)) {
-          statisticsPlanRestricted = true
+        for (const symbol of symbols) {
+          const cached = nextFundamentalsBySymbol.get(symbol) || {
+            symbol,
+            name: quotesBySymbol.get(symbol)?.name || null,
+            exchange: quotesBySymbol.get(symbol)?.exchange || null,
+            marketCap: null,
+            eps: null,
+          }
+
+          nextFundamentalsBySymbol.set(symbol, {
+            ...cached,
+            marketCap: marketCapsBySymbol.get(symbol) ?? cached.marketCap ?? null,
+          })
         }
-        statisticsFailures.push({
-          symbol: result.symbol,
-          error: result.error,
+
+        fundamentalsCache = {
+          symbolsKey: symbols.join(','),
+          marketCapFetchedAt: nowMs,
+          bySymbol: nextFundamentalsBySymbol,
+        }
+      } catch (error) {
+        marketCapFailures.push({
+          symbol: 'FMP',
+          error: error instanceof Error ? error.message : 'Unknown FMP market cap error',
         })
-      }
-    }
-
-    if (statisticResults.some((result) => result.fundamentals)) {
-      fundamentalsCache = {
-        symbolsKey: symbols.join(','),
-        fetchedAt: nowMs,
-        bySymbol: nextFundamentalsBySymbol,
       }
     }
   }
@@ -701,7 +730,7 @@ async function fetchTwelveDataStocks(symbols) {
     if (updatedFromEarnings) {
       fundamentalsCache = {
         symbolsKey: symbols.join(','),
-        fetchedAt: nowMs,
+        marketCapFetchedAt: fundamentalsCache.marketCapFetchedAt,
         bySymbol: nextFundamentalsBySymbol,
       }
     }
@@ -729,9 +758,9 @@ async function fetchTwelveDataStocks(symbols) {
           missingQuoteSymbols.length > 8 ? ', ...' : ''
         }.`
       : null,
-    statisticsPlanRestricted
-      ? 'Twelve Data statistics is not included for most configured symbols on the current plan, so market cap may show as N/A.'
-      : summarizeFailures('Twelve Data statistics', statisticsFailures),
+    marketCapFailures.length && !fmpApiKey
+      ? 'FMP_API_KEY is not set, so Market Cap will show as N/A until FMP batch market cap is configured.'
+      : summarizeFailures('FMP market cap', marketCapFailures),
     summarizeFailures('Twelve Data earnings', earningsFailures),
     missingEpsSymbols.length
       ? `${missingEpsSymbols.length} configured symbol${
@@ -741,7 +770,7 @@ async function fetchTwelveDataStocks(symbols) {
     missingMarketCapSymbols.length
       ? `${missingMarketCapSymbols.length} configured symbol${
           missingMarketCapSymbols.length === 1 ? '' : 's'
-        } do not have market cap data available under the current Twelve Data access level.`
+        } do not have market cap data cached from FMP yet.`
       : null,
     incompleteSymbols.length
       ? `${incompleteSymbols.length} configured symbol${
@@ -757,7 +786,7 @@ async function fetchTwelveDataStocks(symbols) {
   return {
     updatedAt: now.toISOString(),
     updatedLabel: formatDisplayTimestamp(now),
-    source: 'Twelve Data quote + statistics',
+    source: 'Twelve Data quote + Twelve Data earnings + FMP market cap',
     warning: warning || null,
     stocks: sortByHighProximity(stocks),
   }
@@ -792,7 +821,7 @@ async function buildStocksPayload({ force = false } = {}) {
       symbolsKey,
       payload,
       fundamentalsCache.bySymbol,
-      fundamentalsCache.fetchedAt,
+      fundamentalsCache.marketCapFetchedAt,
     )
 
     return {
