@@ -24,7 +24,7 @@ const marketCapCacheTtlMs =
     process.env.FMP_MARKET_CAP_CACHE_SECONDS || process.env.TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS,
     86400,
   ) * 1000
-const earningsRefreshLimit = parsePositiveInt(process.env.TWELVE_DATA_EARNINGS_REFRESH_LIMIT, 1)
+const earningsRefreshLimit = parsePositiveInt(process.env.TWELVE_DATA_EARNINGS_REFRESH_LIMIT, 1000)
 
 let stockCache = {
   symbolsKey: '',
@@ -356,14 +356,46 @@ function extractLatestReportedEps(earningsPayload) {
     return null
   }
 
-  for (const entry of earningsPayload.earnings) {
-    const actual = numberOrNull(entry?.eps_actual)
-    if (actual !== null) {
-      return actual
+  const datedEarnings = earningsPayload.earnings
+    .map((entry) => ({
+      actual: numberOrNull(entry?.eps_actual),
+      date: readString(entry?.date),
+    }))
+    .filter((entry) => entry.actual !== null && entry.date)
+    .sort((left, right) => new Date(right.date).getTime() - new Date(left.date).getTime())
+
+  const selectedQuarterlyEarnings = []
+
+  for (const entry of datedEarnings) {
+    const entryTime = new Date(entry.date).getTime()
+
+    if (!Number.isFinite(entryTime)) {
+      continue
+    }
+
+    const isDistinctQuarter = selectedQuarterlyEarnings.every(
+      (selected) => Math.abs(entryTime - selected.time) >= 45 * 24 * 60 * 60 * 1000,
+    )
+
+    if (!isDistinctQuarter) {
+      continue
+    }
+
+    selectedQuarterlyEarnings.push({
+      time: entryTime,
+      actual: entry.actual,
+    })
+
+    if (selectedQuarterlyEarnings.length === 4) {
+      break
     }
   }
 
-  return null
+  if (selectedQuarterlyEarnings.length === 4) {
+    return selectedQuarterlyEarnings.reduce((sum, entry) => sum + entry.actual, 0)
+  }
+
+  return datedEarnings[0]?.actual ?? null
 }
 
 function normalizeQuote(symbol, quote, fundamentals) {

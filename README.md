@@ -50,7 +50,7 @@ Set this Render environment variable:
 Optional:
 
 - `TWELVE_DATA_QUOTE_CACHE_SECONDS`: quote payload cache TTL. Default is `300`
-- `TWELVE_DATA_EARNINGS_REFRESH_LIMIT`: number of symbols to backfill from `/earnings` per refresh. Default is `1`
+- `TWELVE_DATA_EARNINGS_REFRESH_LIMIT`: number of symbols to backfill from `/earnings` per refresh. Default is `1000`
 - `FMP_MARKET_CAP_CACHE_SECONDS`: Market Cap cache TTL. Default is `86400`
 
 ## How The Provider Calls Work
@@ -58,7 +58,7 @@ Optional:
 - Quotes are fetched from Twelve Data `/quote`
 - The server requests all configured symbols in one quote batch query
 - Market cap is filled from FMP batch market cap once per cache window
-- EPS is filled from the latest reported value from Twelve Data `/earnings`
+- EPS is approximated as trailing 12-month EPS by summing the latest four distinct quarterly `eps_actual` values from Twelve Data `/earnings`
 - The merged cache is persisted in Render Key Value so it survives instance spin-downs
 - Market cap is cached daily and EPS is cached after it is first retrieved, so normal refreshes stay cheap
 

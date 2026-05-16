@@ -23,7 +23,7 @@ services:
       - key: FMP_MARKET_CAP_CACHE_SECONDS
         value: "86400"
       - key: TWELVE_DATA_EARNINGS_REFRESH_LIMIT
-        value: "1"
+        value: "1000"
 
   - type: keyvalue
     name: nima-stock-tracker-cache
