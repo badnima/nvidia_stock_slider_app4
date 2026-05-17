@@ -6,13 +6,13 @@ type StockQuote = {
   symbol: string
   name: string
   eps: number | null
+  peRatio: number | null
   marketCap: number | null
   currentPrice: number | null
   week52Low: number | null
   week52High: number | null
   positionPercent: number | null
   distanceFromHighPercent: number | null
-  exchange: string | null
 }
 
 type FreshnessStatus = {
@@ -79,6 +79,10 @@ function formatMarketCap(value: number | null) {
 }
 
 function formatEps(value: number | null) {
+  return typeof value === 'number' ? value.toFixed(2) : 'N/A'
+}
+
+function formatPeRatio(value: number | null) {
   return typeof value === 'number' ? value.toFixed(2) : 'N/A'
 }
 
@@ -265,6 +269,7 @@ function App() {
           <div className="table-grid table-head" role="row">
             <span>Stock</span>
             <span>EPS</span>
+            <span>P/E</span>
             <span>Market Cap</span>
             <span>52-Week Position</span>
           </div>
@@ -293,10 +298,14 @@ function App() {
               <article className="table-grid stock-row" key={stock.symbol}>
                 <div className="company-cell">
                   <strong>{formatCompanyLabel(stock)}</strong>
-                  {stock.exchange ? <small>{stock.exchange}</small> : null}
                 </div>
                 <div className="number-cell">
                   {renderPendingValue(stock.eps, formatEps, payload?.buildStage === 'quotes' || payload?.buildStage === 'market-cap' ? 'Queued' : 'Fetching')}
+                </div>
+                <div className="number-cell">
+                  {payload?.isBuilding && stock.peRatio === null
+                    ? <span className="pending-chip">{payload?.buildStage === 'quotes' || payload?.buildStage === 'market-cap' ? 'Queued' : 'Fetching'}</span>
+                    : formatPeRatio(stock.peRatio)}
                 </div>
                 <div className="number-cell">
                   {renderPendingValue(stock.marketCap, formatMarketCap, payload?.buildStage === 'quotes' ? 'Queued' : 'Fetching')}

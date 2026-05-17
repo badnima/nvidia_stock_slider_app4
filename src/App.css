@@ -186,10 +186,11 @@ h1 {
 .table-grid {
   display: grid;
   grid-template-columns:
-    minmax(260px, 1.5fr)
-    minmax(80px, 0.55fr)
-    minmax(116px, 0.7fr)
-    minmax(360px, 1.75fr);
+    minmax(260px, 1.45fr)
+    minmax(80px, 0.48fr)
+    minmax(80px, 0.48fr)
+    minmax(116px, 0.65fr)
+    minmax(340px, 1.7fr);
   align-items: center;
   gap: 14px;
 }
@@ -234,7 +235,6 @@ h1 {
   white-space: nowrap;
 }
 
-.company-cell small,
 .distance-label {
   color: var(--muted);
   font-size: 0.78rem;
@@ -243,6 +243,7 @@ h1 {
 .number-cell {
   color: var(--text);
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .pending-chip {

@@ -504,11 +504,15 @@ function normalizeQuote(symbol, quote, fundamentals) {
     readString(quote?.companyName) ||
     readString(fundamentals?.name) ||
     symbol
+  const peRatio =
+    firstNumber(quote?.pe, quote?.pe_ratio, quote?.price_earnings_ratio) ??
+    (typeof currentPrice === 'number' && typeof eps === 'number' && eps > 0 ? currentPrice / eps : null)
 
   const normalized = {
     symbol,
     name,
     eps,
+    peRatio,
     marketCap,
     currentPrice,
     week52Low,
