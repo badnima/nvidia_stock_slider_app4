@@ -9,7 +9,28 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: TWELVE_DATA_API_KEY
+        sync: false
       - key: FMP_API_KEY
         sync: false
-      - key: FMP_CACHE_TTL_SECONDS
-        value: "300"
+      - key: RENDER_KEY_VALUE_URL
+        fromService:
+          name: nima-stock-tracker-cache
+          type: keyvalue
+          property: connectionString
+      - key: TWELVE_DATA_QUOTE_CACHE_SECONDS
+        value: "60"
+      - key: FMP_MARKET_CAP_CACHE_SECONDS
+        value: "86400"
+      - key: TWELVE_DATA_EPS_CACHE_SECONDS
+        value: "604800"
+      - key: TWELVE_DATA_EPS_BATCH_SIZE
+        value: "1"
+      - key: BACKGROUND_REFRESH_INTERVAL_SECONDS
+        value: "60"
+
+  - type: keyvalue
+    name: nima-stock-tracker-cache
+    plan: starter
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { RefreshCcw, Server, TrendingUp } from 'lucide-react'
+import { DatabaseZap, RefreshCcw, Server, TrendingUp } from 'lucide-react'
 import './App.css'
 
 type StockQuote = {
@@ -15,12 +15,39 @@ type StockQuote = {
   exchange: string | null
 }
 
+type FreshnessStatus = {
+  updatedAt: string | null
+  updatedLabel: string | null
+  stale: boolean
+  missingCount: number
+}
+
+type EpsFreshnessStatus = FreshnessStatus & {
+  batchSize: number
+  nextSymbols: string[]
+}
+
 type StocksPayload = {
   updatedAt: string | null
   updatedLabel: string | null
   source: string | null
   warning: string | null
-  cached: boolean
+  stale: boolean
+  buildStage?: 'quotes' | 'market-cap' | 'eps' | 'complete'
+  isBuilding?: boolean
+  readyCounts?: {
+    quotes: number
+    marketCap: number
+    eps: number
+    total: number
+  }
+  statusHeadline: string
+  statusDetail: string | null
+  freshness: {
+    quotes: FreshnessStatus
+    marketCap: FreshnessStatus
+    eps: EpsFreshnessStatus
+  }
   stocks: StockQuote[]
 }
 
@@ -55,6 +82,24 @@ function formatEps(value: number | null) {
   return typeof value === 'number' ? value.toFixed(2) : 'N/A'
 }
 
+function renderPendingValue(value: number | null, formatter: (value: number | null) => string, pendingLabel: string) {
+  if (typeof value === 'number') {
+    return formatter(value)
+  }
+
+  return <span className="pending-chip">{pendingLabel}</span>
+}
+
+function formatCompanyLabel(stock: StockQuote) {
+  const normalizedName = stock.name.trim()
+
+  if (!normalizedName || normalizedName.toUpperCase() === stock.symbol) {
+    return stock.symbol
+  }
+
+  return `${normalizedName} (${stock.symbol})`
+}
+
 function clampPercent(value: number | null) {
   if (typeof value !== 'number') {
     return 0
@@ -77,28 +122,40 @@ function sortByHighProximity(stocks: StockQuote[]) {
   })
 }
 
+function formatFreshnessLabel(label: string, freshness: FreshnessStatus | EpsFreshnessStatus) {
+  if (freshness.updatedLabel) {
+    return `${label}: ${freshness.updatedLabel}${freshness.stale ? ' (refreshing)' : ''}`
+  }
+
+  return `${label}: warming cache`
+}
+
 function App() {
   const [payload, setPayload] = useState<StocksPayload | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [isRefreshing, setIsRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const stocks = useMemo(() => sortByHighProximity(payload?.stocks ?? []), [payload])
 
   const loadStocks = useCallback(async ({ refresh = false } = {}) => {
-    setIsLoading(true)
+    if (refresh) {
+      setIsRefreshing(true)
+    } else {
+      setIsLoading(true)
+    }
+
     setError(null)
 
     try {
-      const response = await fetch(`/api/stocks${refresh ? '?refresh=true' : ''}`, {
+      const response = await fetch(refresh ? '/api/stocks?refresh=true' : '/api/stocks', {
         cache: 'no-store',
       })
       const nextPayload = (await response.json()) as StocksPayload | ApiErrorPayload
 
       if (!response.ok) {
         const apiError = nextPayload as ApiErrorPayload
-        throw new Error(
-          [apiError.error, apiError.detail, apiError.hint].filter(Boolean).join(' '),
-        )
+        throw new Error([apiError.error, apiError.hint].filter(Boolean).join(' '))
       }
 
       setPayload(nextPayload as StocksPayload)
@@ -106,35 +163,64 @@ function App() {
       setError(loadError instanceof Error ? loadError.message : 'Unable to load stock data.')
     } finally {
       setIsLoading(false)
+      setIsRefreshing(false)
     }
   }, [])
 
   useEffect(() => {
     loadStocks()
+
+    const refreshTimer = setInterval(() => {
+      void loadStocks()
+    }, 15000)
+
+    return () => {
+      clearInterval(refreshTimer)
+    }
   }, [loadStocks])
+
+  const quoteSummary = payload ? formatFreshnessLabel('Quotes', payload.freshness.quotes) : 'Quotes: warming cache'
+  const marketCapSummary = payload
+    ? payload.freshness.marketCap.missingCount > 0
+      ? `Market Cap: ${payload.stocks.length - payload.freshness.marketCap.missingCount}/${payload.stocks.length} ready`
+      : formatFreshnessLabel('Market Cap', payload.freshness.marketCap)
+    : 'Market Cap: warming cache'
+  const epsSummary = payload
+    ? payload.freshness.eps.missingCount > 0
+      ? `EPS: ${payload.stocks.length - payload.freshness.eps.missingCount}/${payload.stocks.length} ready`
+      : formatFreshnessLabel('EPS', payload.freshness.eps)
+    : 'EPS: warming cache'
+  const stageSummary = payload?.readyCounts
+    ? `${payload.readyCounts.quotes}/${payload.readyCounts.total} prices · ${payload.readyCounts.marketCap}/${payload.readyCounts.total} Market Cap · ${payload.readyCounts.eps}/${payload.readyCounts.total} EPS`
+    : 'Building live data in stages'
 
   return (
     <main>
       <header className="page-header">
         <div className="header-inner">
           <div>
-            <p className="eyebrow">FMP Market View</p>
+            <p className="eyebrow">Server-Managed Stock Cache</p>
             <h1>52-Week Stock Position</h1>
             <p className="updated-at">
-              {payload?.updatedLabel ? `Latest refresh: ${payload.updatedLabel}` : 'Loading market data...'}
-              {payload?.cached ? ' · cached' : ''}
+              {payload?.updatedLabel ? `Latest quote refresh: ${payload.updatedLabel}` : 'Loading market data...'}
             </p>
+            <p className="status-message">
+              {payload?.statusHeadline ?? 'Loading live stock prices into the shared cache.'}
+            </p>
+            {payload?.statusDetail ? <p className="status-detail">{payload.statusDetail}</p> : null}
+            <p className="stage-detail">{stageSummary}</p>
             {payload?.warning ? <p className="warning-text">{payload.warning}</p> : null}
+            {error ? <p className="warning-text">{error}</p> : null}
           </div>
 
           <button
             className="refresh-button"
             type="button"
-            onClick={() => loadStocks({ refresh: true })}
-            disabled={isLoading}
+            onClick={() => void loadStocks({ refresh: true })}
+            disabled={isRefreshing}
           >
-            <RefreshCcw size={18} className={isLoading ? 'spin' : undefined} />
-            {isLoading ? 'Refreshing' : 'Refresh'}
+            <RefreshCcw size={18} className={isRefreshing ? 'spin' : undefined} />
+            {isRefreshing ? 'Refreshing' : 'Refresh Quotes'}
           </button>
         </div>
       </header>
@@ -143,18 +229,41 @@ function App() {
         <div className="status-strip">
           <span>
             <Server size={16} />
-            {payload?.source ? `${payload.source} loaded server-side` : 'FMP data loaded server-side'}
+            {payload?.source ?? 'Shared cache warming on the server'}
           </span>
-          <span>
+          <span className={payload?.freshness.quotes.stale ? 'status-pill stale' : 'status-pill'}>
             <TrendingUp size={16} />
-            Sorted closest to 52-week high
+            {quoteSummary}
+          </span>
+          <span className={payload?.freshness.marketCap.missingCount ? 'status-pill stale' : 'status-pill'}>
+            <DatabaseZap size={16} />
+            {marketCapSummary}
+          </span>
+          <span className={payload?.freshness.eps.missingCount ? 'status-pill stale' : 'status-pill'}>
+            <DatabaseZap size={16} />
+            {epsSummary}
           </span>
         </div>
 
+        {payload?.freshness.eps.nextSymbols.length ? (
+          <p className="queue-text">
+            Next EPS refresh batch: {payload.freshness.eps.nextSymbols.join(', ')}. The server refreshes up to{' '}
+            {payload.freshness.eps.batchSize} symbol{payload.freshness.eps.batchSize === 1 ? '' : 's'} per minute.
+          </p>
+        ) : null}
+
+        {payload?.isBuilding ? (
+          <div className="build-banner" role="status" aria-live="polite">
+            <strong>Fetching information in stages.</strong>
+            <span>
+              The page loads stock prices first, then Market Cap, then EPS as cache refresh jobs complete.
+            </span>
+          </div>
+        ) : null}
+
         <section className="table-shell" aria-label="52-week stock position table">
           <div className="table-grid table-head" role="row">
-            <span>Stock Ticker</span>
-            <span>Stock Name</span>
+            <span>Stock</span>
             <span>EPS</span>
             <span>Market Cap</span>
             <span>52-Week Position</span>
@@ -164,50 +273,55 @@ function App() {
             <div className="message-row">Loading latest stock data...</div>
           ) : null}
 
-          {error ? <div className="message-row error-row">{error}</div> : null}
-
-          {!isLoading && !error && stocks.length === 0 ? (
-            <div className="message-row">No stocks are configured.</div>
+          {!isLoading && !payload && !error ? (
+            <div className="message-row">No cached stock payload is available yet.</div>
           ) : null}
 
-          {!error
-            ? stocks.map((stock) => {
-                const percent = clampPercent(stock.positionPercent)
-                const hasSlider =
-                  typeof stock.currentPrice === 'number' &&
-                  typeof stock.week52Low === 'number' &&
-                  typeof stock.week52High === 'number' &&
-                  stock.week52High > stock.week52Low
-                const highDistance =
-                  typeof stock.distanceFromHighPercent === 'number'
-                    ? `${Math.max(0, stock.distanceFromHighPercent).toFixed(1)}% below high`
-                    : 'Position unavailable'
+          {stocks.map((stock) => {
+            const percent = clampPercent(stock.positionPercent)
+            const hasSlider =
+              typeof stock.currentPrice === 'number' &&
+              typeof stock.week52Low === 'number' &&
+              typeof stock.week52High === 'number' &&
+              stock.week52High > stock.week52Low
+            const highDistance =
+              typeof stock.distanceFromHighPercent === 'number'
+                ? `${Math.max(0, stock.distanceFromHighPercent).toFixed(1)}% below high`
+                : 'Position unavailable'
 
-                return (
-                  <article className="table-grid stock-row" key={stock.symbol}>
-                    <div className="ticker-cell">
-                      <strong>{stock.symbol}</strong>
-                      {stock.exchange ? <small>{stock.exchange}</small> : null}
-                    </div>
-                    <div className="company-cell">{stock.name}</div>
-                    <div className="number-cell">{formatEps(stock.eps)}</div>
-                    <div className="number-cell">{formatMarketCap(stock.marketCap)}</div>
-                    <div className="slider-cell">
-                      <div className={hasSlider ? 'slider-track' : 'slider-track slider-disabled'}>
-                        <span className="slider-fill" style={{ width: `${percent}%` }} />
-                        <span className="slider-thumb" style={{ left: `${percent}%` }} />
-                      </div>
+            return (
+              <article className="table-grid stock-row" key={stock.symbol}>
+                <div className="company-cell">
+                  <strong>{formatCompanyLabel(stock)}</strong>
+                  {stock.exchange ? <small>{stock.exchange}</small> : null}
+                </div>
+                <div className="number-cell">
+                  {renderPendingValue(stock.eps, formatEps, payload?.buildStage === 'quotes' || payload?.buildStage === 'market-cap' ? 'Queued' : 'Fetching')}
+                </div>
+                <div className="number-cell">
+                  {renderPendingValue(stock.marketCap, formatMarketCap, payload?.buildStage === 'quotes' ? 'Queued' : 'Fetching')}
+                </div>
+                <div className="slider-cell">
+                  <div className={hasSlider ? 'slider-track' : 'slider-track slider-disabled'}>
+                    <span className="slider-fill" style={{ width: `${percent}%` }} />
+                    <span className="slider-thumb" style={{ left: `${percent}%` }} />
+                  </div>
+                  {hasSlider ? (
+                    <>
                       <div className="slider-scale">
                         <span>{formatCurrency(stock.week52Low)}</span>
                         <strong>{formatCurrency(stock.currentPrice)}</strong>
                         <span>{formatCurrency(stock.week52High)}</span>
                       </div>
                       <p className="distance-label">{highDistance}</p>
-                    </div>
-                  </article>
-                )
-              })
-            : null}
+                    </>
+                  ) : (
+                    <p className="distance-label pending-label">Fetching latest quote range...</p>
+                  )}
+                </div>
+              </article>
+            )
+          })}
         </section>
       </section>
     </main>
