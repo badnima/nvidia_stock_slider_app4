@@ -88,6 +88,16 @@ function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
+function normalizeStage(value) {
+  const stage = readString(value)?.toLowerCase()
+
+  if (stage === 'quotes' || stage === 'market-cap' || stage === 'eps' || stage === 'all') {
+    return stage
+  }
+
+  return 'all'
+}
+
 function getKeyValueUrl() {
   return (
     process.env.RENDER_KEY_VALUE_URL ||
@@ -298,6 +308,22 @@ function formatDisplayTimestamp(date) {
     timeZone: 'America/Los_Angeles',
     timeZoneName: 'short',
   }).format(date)
+}
+
+function buildSourceLabel({ includeMarketCap, includeEps, usedCachedMarketCap }) {
+  const parts = ['Twelve Data quote']
+
+  if (includeMarketCap) {
+    parts.push('FMP market cap')
+  } else if (usedCachedMarketCap) {
+    parts.push('cached FMP market cap')
+  }
+
+  if (includeEps) {
+    parts.push('Twelve Data earnings')
+  }
+
+  return parts.join(' + ')
 }
 
 function getTwelveDataApiKey() {
@@ -725,7 +751,13 @@ function loadPersistedCachesIfNeeded(symbolsKey, persistedCache) {
   }
 }
 
-async function fetchTwelveDataStocks(symbols) {
+async function fetchTwelveDataStocks(
+  symbols,
+  {
+    includeMarketCap = true,
+    includeEps = true,
+  } = {},
+) {
   const apiKey = getTwelveDataApiKey()
   const fmpApiKey = getFmpApiKey()
   const now = new Date()
@@ -752,10 +784,12 @@ async function fetchTwelveDataStocks(symbols) {
       ? new Map(fundamentalsCache.bySymbol)
       : new Map()
   const marketCapFailures = []
+  const hadCachedMarketCap = symbols.some((symbol) => nextFundamentalsBySymbol.get(symbol)?.marketCap !== null)
   const needMarketCapRefresh =
-    fundamentalsCache.symbolsKey !== symbols.join(',') ||
-    !symbols.every((symbol) => nextFundamentalsBySymbol.get(symbol)?.marketCap !== null) ||
-    nowMs - fundamentalsCache.marketCapFetchedAt >= marketCapCacheTtlMs
+    includeMarketCap &&
+    (fundamentalsCache.symbolsKey !== symbols.join(',') ||
+      !symbols.every((symbol) => nextFundamentalsBySymbol.get(symbol)?.marketCap !== null) ||
+      nowMs - fundamentalsCache.marketCapFetchedAt >= marketCapCacheTtlMs)
 
   if (needMarketCapRefresh) {
     if (!fmpApiKey) {
@@ -796,12 +830,14 @@ async function fetchTwelveDataStocks(symbols) {
     }
   }
 
-  const symbolsForEarnings = symbols
+  const symbolsForEarnings = includeEps
+    ? symbols
     .filter((symbol) => {
       const cached = nextFundamentalsBySymbol.get(symbol)
       return !cached || cached.eps === null
     })
     .slice(0, earningsRefreshLimit)
+    : []
   const earningsFailures = []
 
   if (symbolsForEarnings.length) {
@@ -881,16 +917,18 @@ async function fetchTwelveDataStocks(symbols) {
           missingQuoteSymbols.length > 8 ? ', ...' : ''
         }.`
       : null,
-    marketCapFailures.length && !fmpApiKey
-      ? 'FMP_API_KEY is not set, so Market Cap will show as N/A until FMP batch market cap is configured.'
-      : summarizeFailures('FMP market cap', marketCapFailures),
-    summarizeFailures('Twelve Data earnings', earningsFailures),
-    missingEpsSymbols.length
+    includeMarketCap
+      ? marketCapFailures.length && !fmpApiKey
+        ? 'FMP_API_KEY is not set, so Market Cap will show as N/A until FMP batch market cap is configured.'
+        : summarizeFailures('FMP market cap', marketCapFailures)
+      : null,
+    includeEps ? summarizeFailures('Twelve Data earnings', earningsFailures) : null,
+    includeEps && missingEpsSymbols.length
       ? `${missingEpsSymbols.length} configured symbol${
           missingEpsSymbols.length === 1 ? '' : 's'
         } still do not have EPS data cached.`
       : null,
-    missingMarketCapSymbols.length
+    includeMarketCap && missingMarketCapSymbols.length
       ? `${missingMarketCapSymbols.length} configured symbol${
           missingMarketCapSymbols.length === 1 ? '' : 's'
         } do not have market cap data cached from FMP yet.`
@@ -909,30 +947,56 @@ async function fetchTwelveDataStocks(symbols) {
   return {
     updatedAt: now.toISOString(),
     updatedLabel: formatDisplayTimestamp(now),
-    source: 'Twelve Data quote + Twelve Data earnings + FMP market cap',
+    source: buildSourceLabel({
+      includeMarketCap,
+      includeEps,
+      usedCachedMarketCap: !includeMarketCap && hadCachedMarketCap,
+    }),
     warning: warning || null,
     stocks: sortByHighProximity(stocks),
   }
 }
 
-async function buildStocksPayload({ force = false } = {}) {
+function applyDisplayStage(payload, stage) {
+  const normalizedStage = normalizeStage(stage)
+  const dataStage = normalizedStage === 'all' || normalizedStage === 'eps' ? 'complete' : normalizedStage
+
+  return {
+    ...payload,
+    dataStage,
+    stocks: payload.stocks.map((stock) => ({
+      ...stock,
+      marketCap: normalizedStage === 'quotes' ? null : stock.marketCap,
+      eps:
+        normalizedStage === 'quotes' || normalizedStage === 'market-cap'
+          ? null
+          : stock.eps,
+    })),
+  }
+}
+
+async function buildStocksPayload({ force = false, stage = 'all' } = {}) {
   const symbols = await readConfiguredSymbols()
   const symbolsKey = symbols.join(',')
   const now = Date.now()
   const persistedCache = await readPersistedCache(symbolsKey)
+  const normalizedStage = normalizeStage(stage)
 
   loadPersistedCachesIfNeeded(symbolsKey, persistedCache)
 
   if (!force && stockCache.payload && stockCache.symbolsKey === symbolsKey && stockCache.expiresAt > now) {
-    return {
+    return applyDisplayStage({
       ...stockCache.payload,
       cached: true,
       stale: false,
-    }
+    }, normalizedStage)
   }
 
   try {
-    const payload = await fetchTwelveDataStocks(symbols)
+    const payload = await fetchTwelveDataStocks(symbols, {
+      includeMarketCap: normalizedStage === 'market-cap' || normalizedStage === 'eps' || normalizedStage === 'all',
+      includeEps: normalizedStage === 'eps' || normalizedStage === 'all',
+    })
     stockCache = {
       symbolsKey,
       expiresAt: now + quoteCacheTtlMs,
@@ -947,11 +1011,11 @@ async function buildStocksPayload({ force = false } = {}) {
       fundamentalsCache.marketCapFetchedAt,
     )
 
-    return {
+    return applyDisplayStage({
       ...payload,
       cached: false,
       stale: false,
-    }
+    }, normalizedStage)
   } catch (error) {
     const fallbackDetail = `Showing cached stock data because the live refresh failed: ${
       error instanceof Error ? error.message : 'Unknown stock data error.'
@@ -971,7 +1035,7 @@ async function buildStocksPayload({ force = false } = {}) {
         payload: fallbackPayload,
       }
 
-      return buildStalePayload(fallbackPayload, fallbackDetail)
+      return applyDisplayStage(buildStalePayload(fallbackPayload, fallbackDetail), normalizedStage)
     }
 
     throw error
@@ -986,7 +1050,10 @@ app.get('/health', (_req, res) => {
 
 app.get('/api/stocks', async (req, res) => {
   try {
-    const payload = await buildStocksPayload({ force: req.query.refresh === 'true' })
+    const payload = await buildStocksPayload({
+      force: req.query.refresh === 'true',
+      stage: typeof req.query.stage === 'string' ? req.query.stage : 'all',
+    })
     res.set('Cache-Control', 'no-store')
     res.json(payload)
   } catch (error) {

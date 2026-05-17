@@ -49,6 +49,7 @@ h1 {
 }
 
 .updated-at,
+.status-message,
 .warning-text {
   margin: 10px 0 0;
   font-size: 0.9rem;
@@ -56,6 +57,12 @@ h1 {
 
 .updated-at {
   color: rgba(255, 255, 255, 0.82);
+}
+
+.status-message {
+  max-width: 760px;
+  color: rgba(217, 239, 171, 0.98);
+  font-weight: 700;
 }
 
 .warning-text {
