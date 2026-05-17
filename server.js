@@ -975,12 +975,13 @@ function buildStatusCopy({
   quoteFresh,
   missingMarketCapCount,
   missingEpsCount,
+  missingPeRatioCount,
   stockCount,
 }) {
   if (!hasQuotes) {
     return {
       headline: 'Fetching live data. This page will build itself out in stages as fresh data arrives.',
-      detail: `Stage 1 loads stock prices for ${stockCount} symbols. Market Cap and EPS will fill in from the shared cache after quotes arrive.`,
+      detail: `Stage 1 loads stock prices for ${stockCount} symbols. Market Cap, EPS, and P/E will fill in from the shared cache after quotes arrive.`,
     }
   }
 
@@ -994,20 +995,27 @@ function buildStatusCopy({
   if (missingMarketCapCount > 0) {
     return {
       headline: 'Stock prices are current. The page is now filling in Market Cap data.',
-      detail: 'This app intentionally loads in stages to stay inside the Twelve Data minute limit. EPS begins after the Market Cap cache warms.',
+      detail: 'This app intentionally loads in stages to stay inside the Twelve Data minute limit. EPS and P/E begin after the Market Cap cache warms.',
     }
   }
 
   if (missingEpsCount > 0) {
     return {
-      headline: 'Stock prices and Market Cap are current. EPS is still filling in.',
+      headline: 'Stock prices and Market Cap are current. EPS and P/E are still filling in.',
       detail: `EPS refresh is throttled to ${epsBatchSize} symbol${epsBatchSize === 1 ? '' : 's'} per minute so the app stays inside your Twelve Data limit.`,
+    }
+  }
+
+  if (missingPeRatioCount > 0) {
+    return {
+      headline: 'Stock prices, Market Cap, and EPS are current. P/E ratios are still settling.',
+      detail: 'P/E ratios are recalculated from the newest prices and cached EPS as soon as both values are available for each stock.',
     }
   }
 
   return {
     headline: 'All data is current.',
-    detail: 'Quotes refresh about once per minute, Market Cap refreshes daily, and EPS stays cached until the next fundamentals refresh window.',
+    detail: 'Quotes refresh about once per minute, Market Cap refreshes daily, and EPS plus P/E stay cached until the next fundamentals refresh window.',
   }
 }
 
@@ -1048,11 +1056,13 @@ function buildStocksPayload(state, symbols) {
   const missingQuoteCount = stocks.filter((stock) => stock.currentPrice === null).length
   const missingMarketCapCount = stocks.filter((stock) => stock.marketCap === null).length
   const missingEpsCount = stocks.filter((stock) => stock.eps === null).length
+  const missingPeRatioCount = stocks.filter((stock) => stock.peRatio === null).length
 
   const quoteFresh = isFresh(state.jobs.quotes.lastSuccessAt, quoteCacheTtlMs + backgroundRefreshIntervalMs, nowMs)
   const marketCapFresh =
     missingMarketCapCount === 0 &&
     isFresh(state.jobs.marketCap.lastSuccessAt, marketCapCacheTtlMs, nowMs)
+  const peRatioFresh = quoteFresh && missingPeRatioCount === 0
   const nextEpsSymbols = pickNextEpsSymbols(
     {
       jobs: {
@@ -1071,6 +1081,7 @@ function buildStocksPayload(state, symbols) {
     quoteFresh,
     missingMarketCapCount,
     missingEpsCount,
+    missingPeRatioCount,
     stockCount: symbols.length,
   })
   const buildStage =
@@ -1080,6 +1091,8 @@ function buildStocksPayload(state, symbols) {
         ? 'market-cap'
         : missingEpsCount > 0
           ? 'eps'
+          : missingPeRatioCount > 0
+            ? 'eps'
           : 'complete'
 
   return {
@@ -1096,6 +1109,7 @@ function buildStocksPayload(state, symbols) {
       quotes: symbols.length - missingQuoteCount,
       marketCap: symbols.length - missingMarketCapCount,
       eps: symbols.length - missingEpsCount,
+      peRatio: symbols.length - missingPeRatioCount,
       total: symbols.length,
     },
     statusHeadline: statusCopy.headline,
@@ -1120,6 +1134,12 @@ function buildStocksPayload(state, symbols) {
         missingCount: missingEpsCount,
         batchSize: epsBatchSize,
         nextSymbols: nextEpsSymbols,
+      },
+      peRatio: {
+        updatedAt: state.jobs.quotes.lastSuccessAt || state.jobs.eps.lastSuccessAt,
+        updatedLabel: formatIsoLabel(state.jobs.quotes.lastSuccessAt || state.jobs.eps.lastSuccessAt),
+        stale: !peRatioFresh,
+        missingCount: missingPeRatioCount,
       },
     },
     stocks: sortByHighProximity(stocks),

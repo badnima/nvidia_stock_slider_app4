@@ -39,6 +39,7 @@ type StocksPayload = {
     quotes: number
     marketCap: number
     eps: number
+    peRatio: number
     total: number
   }
   statusHeadline: string
@@ -47,6 +48,7 @@ type StocksPayload = {
     quotes: FreshnessStatus
     marketCap: FreshnessStatus
     eps: EpsFreshnessStatus
+    peRatio: FreshnessStatus
   }
   stocks: StockQuote[]
 }
@@ -194,8 +196,13 @@ function App() {
       ? `EPS: ${payload.stocks.length - payload.freshness.eps.missingCount}/${payload.stocks.length} ready`
       : formatFreshnessLabel('EPS', payload.freshness.eps)
     : 'EPS: warming cache'
+  const peRatioSummary = payload
+    ? payload.freshness.peRatio.missingCount > 0
+      ? `P/E: ${payload.stocks.length - payload.freshness.peRatio.missingCount}/${payload.stocks.length} ready`
+      : formatFreshnessLabel('P/E', payload.freshness.peRatio)
+    : 'P/E: warming cache'
   const stageSummary = payload?.readyCounts
-    ? `${payload.readyCounts.quotes}/${payload.readyCounts.total} prices · ${payload.readyCounts.marketCap}/${payload.readyCounts.total} Market Cap · ${payload.readyCounts.eps}/${payload.readyCounts.total} EPS`
+    ? `${payload.readyCounts.quotes}/${payload.readyCounts.total} prices · ${payload.readyCounts.marketCap}/${payload.readyCounts.total} Market Cap · ${payload.readyCounts.eps}/${payload.readyCounts.total} EPS · ${payload.readyCounts.peRatio}/${payload.readyCounts.total} P/E`
     : 'Building live data in stages'
 
   return (
@@ -247,6 +254,10 @@ function App() {
             <DatabaseZap size={16} />
             {epsSummary}
           </span>
+          <span className={payload?.freshness.peRatio.missingCount ? 'status-pill stale' : 'status-pill'}>
+            <TrendingUp size={16} />
+            {peRatioSummary}
+          </span>
         </div>
 
         {payload?.freshness.eps.nextSymbols.length ? (
@@ -260,7 +271,7 @@ function App() {
           <div className="build-banner" role="status" aria-live="polite">
             <strong>Fetching information in stages.</strong>
             <span>
-              The page loads stock prices first, then Market Cap, then EPS as cache refresh jobs complete.
+              The page loads stock prices first, then Market Cap, then EPS and P/E as cache refresh jobs complete.
             </span>
           </div>
         ) : null}
