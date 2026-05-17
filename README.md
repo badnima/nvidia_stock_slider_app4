@@ -1,17 +1,36 @@
 # Nima Stock Tracker
 
-A Render-ready React and Express app that displays a configurable stock dashboard using Twelve Data for quotes and earnings plus FMP for cached market caps, with Render Key Value for durable cache storage.
+A Render-ready React + Express stock dashboard that is built around a shared server cache instead of live browser-side provider fetches.
 
-## Features
+## What Changed
 
-- Reads stock symbols from `stocks.json`
-- Fetches live quote data from Twelve Data server-side with `TWELVE_DATA_API_KEY`
-- Fetches Market Cap from FMP batch market cap with `FMP_API_KEY`
-- Persists the last good cache payload in Render Key Value with `RENDER_KEY_VALUE_URL`
-- Shows stock ticker, stock name, EPS, market cap, current price, 52-week low, and 52-week high
-- Sorts stocks from closest to farthest from their 52-week high
-- Uses a persisted fallback cache so the app can still render if a live provider request fails
-- Caches fundamentals longer than quotes so normal refreshes stay well under provider limits
+This app now treats each data type according to how often it really changes:
+
+- **Quotes** come from Twelve Data and refresh about once per minute.
+- **Market Cap** comes from FMP and refreshes on a daily cache window.
+- **EPS** comes from Twelve Data earnings and refreshes slowly in a throttled background queue.
+
+The browser only requests one cached payload from `/api/stocks`. It no longer tries to fetch quote, Market Cap, and EPS data directly in sequence.
+
+## Why This Architecture Works Better
+
+- It respects your **55 Twelve Data credits per minute** limit.
+- Quotes stay fresh without spending credits on fundamentals every page load.
+- EPS warming is gradual, so the app no longer blows through the limit on cold start.
+- The last good payload is persisted in **Render Key Value**, so a Render spin-down does not erase the cache.
+
+## Cache Strategy
+
+- **Hot cache**: Render Key Value via `RENDER_KEY_VALUE_URL`
+- **Local fallback**: `.stock-cache.json`
+- **Shared payload**: the server merges quotes, Market Cap, and EPS into one response for the frontend
+
+This app does **not** use a Google Doc or Google Sheet as the primary cache. Those are a poor fit for high-frequency server reads/writes and concurrent refreshes. Render Key Value is the correct primary cache for this deployment.
+
+## Provider Layout
+
+- **Twelve Data**: quotes and EPS earnings history
+- **FMP**: batch Market Cap
 
 ## Local Run
 
@@ -23,60 +42,55 @@ npm start
 
 Open `http://localhost:3000/`.
 
-For local live data, create a `.env` file from `.env.example` and set `TWELVE_DATA_API_KEY`, `FMP_API_KEY`, and optionally `RENDER_KEY_VALUE_URL`.
+For local live data, create a `.env` file from `.env.example`.
 
-## Configure Stocks
+## Required Environment Variables
 
-Edit `stocks.json` and update the `stocks` array:
+- `TWELVE_DATA_API_KEY`
+- `FMP_API_KEY`
+- `RENDER_KEY_VALUE_URL`
 
-```json
-{
-  "stocks": ["NVDA", "MSFT", "AMZN"]
-}
-```
+## Optional Environment Variables
 
-Duplicate symbols are ignored by the server so each stock displays once.
+- `TWELVE_DATA_QUOTE_CACHE_SECONDS`
+  - Default: `60`
+  - How long quotes stay fresh before the server refreshes them.
+- `FMP_MARKET_CAP_CACHE_SECONDS`
+  - Default: `86400`
+  - How long Market Cap stays fresh before the server refreshes it.
+- `TWELVE_DATA_EPS_CACHE_SECONDS`
+  - Default: `604800`
+  - How long EPS stays fresh before the background queue revisits it.
+- `TWELVE_DATA_EPS_BATCH_SIZE`
+  - Default: `1`
+  - How many symbols the background EPS queue refreshes per minute.
+- `BACKGROUND_REFRESH_INTERVAL_SECONDS`
+  - Default: `60`
+  - How often the server wakes up its background refresh loop.
+
+## How The App Refreshes
+
+1. The first request warms quotes immediately if the cache is empty.
+2. Market Cap refreshes only when missing or stale.
+3. EPS refreshes in a slow queue, one symbol at a time by default.
+4. The frontend polls the cached payload every minute.
+
+This keeps the page responsive while still allowing the fundamentals cache to fill in over time.
 
 ## Render Deploy
 
-This repo includes `render.yaml` for a Node web service.
+This repo includes `render.yaml` for:
 
-Set this Render environment variable:
+- the Node web service
+- a Render Key Value instance named `nima-stock-tracker-cache`
 
-- `TWELVE_DATA_API_KEY`: your Twelve Data API key
-- `FMP_API_KEY`: your Financial Modeling Prep API key for Market Cap
-- `RENDER_KEY_VALUE_URL`: automatically populated from the Render Key Value service in `render.yaml`
+The web service receives `RENDER_KEY_VALUE_URL` automatically from that Key Value service.
 
-Optional:
-
-- `TWELVE_DATA_QUOTE_CACHE_SECONDS`: quote payload cache TTL. Default is `300`
-- `TWELVE_DATA_EARNINGS_REFRESH_LIMIT`: number of symbols to backfill from `/earnings` per refresh. Default is `1000`
-- `FMP_MARKET_CAP_CACHE_SECONDS`: Market Cap cache TTL. Default is `86400`
-
-## How The Provider Calls Work
-
-- Quotes are fetched from Twelve Data `/quote`
-- The server requests all configured symbols in one quote batch query
-- Market cap is filled from FMP batch market cap once per cache window
-- EPS is approximated as trailing 12-month EPS by summing the latest four distinct quarterly `eps_actual` values from Twelve Data `/earnings`
-- The merged cache is persisted in Render Key Value so it survives instance spin-downs
-- Market cap is cached daily and EPS is cached after it is first retrieved, so normal refreshes stay cheap
-
-This means the first warm-up after deploy may cost more API calls than later refreshes, but regular usage stays much cheaper.
-
-## Render Key Value
-
-- `render.yaml` now provisions a Render Key Value instance named `nima-stock-tracker-cache`
-- The web service receives its internal Redis connection string automatically through `fromService`
-- The Key Value service is set to `starter` because free Render Key Value instances do not persist data to disk
-
-## Troubleshooting Live Data
+## Troubleshooting
 
 Open `/api/stocks` on the deployed Render URL.
 
-- If you see `Missing TWELVE_DATA_API_KEY`, add `TWELVE_DATA_API_KEY` in Render under Environment.
-- If you see a Twelve Data `429` error, the app is being rate-limited by the provider. Wait for the per-minute quota window to reset and try again.
-- If you see a Twelve Data `401` or `403` error, confirm the key is valid and has access to quote and earnings endpoints.
-- If you see an FMP error for Market Cap, confirm `FMP_API_KEY` is present and has access to the market cap endpoints.
-- If Render Key Value is unavailable, confirm `RENDER_KEY_VALUE_URL` points to your Key Value instance's internal connection string.
-- If a live refresh fails after at least one successful load, the server will fall back to the last cached payload from Render Key Value, then to `.stock-cache.json` if needed.
+- If quotes are missing, confirm `TWELVE_DATA_API_KEY`.
+- If Market Cap is missing, confirm `FMP_API_KEY`.
+- If the app says EPS is still warming, that is expected on a cold cache. The server will keep filling it in automatically.
+- If Render Key Value is unavailable, confirm `RENDER_KEY_VALUE_URL` is populated from the Key Value service.

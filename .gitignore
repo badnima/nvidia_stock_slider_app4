@@ -15,6 +15,7 @@ dist-ssr
 .env
 .env.*
 !.env.example
+.stock-cache.json
 
 # Editor directories and files
 .vscode/*

@@ -1,8 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { RefreshCcw, Server, TrendingUp } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { DatabaseZap, RefreshCcw, Server, TrendingUp } from 'lucide-react'
 import './App.css'
-
-type LoadStage = 'quotes' | 'market-cap' | 'eps' | 'all'
 
 type StockQuote = {
   symbol: string
@@ -17,13 +15,31 @@ type StockQuote = {
   exchange: string | null
 }
 
+type FreshnessStatus = {
+  updatedAt: string | null
+  updatedLabel: string | null
+  stale: boolean
+  missingCount: number
+}
+
+type EpsFreshnessStatus = FreshnessStatus & {
+  batchSize: number
+  nextSymbols: string[]
+}
+
 type StocksPayload = {
   updatedAt: string | null
   updatedLabel: string | null
   source: string | null
   warning: string | null
-  cached: boolean
-  dataStage?: string | null
+  stale: boolean
+  statusHeadline: string
+  statusDetail: string | null
+  freshness: {
+    quotes: FreshnessStatus
+    marketCap: FreshnessStatus
+    eps: EpsFreshnessStatus
+  }
   stocks: StockQuote[]
 }
 
@@ -80,37 +96,33 @@ function sortByHighProximity(stocks: StockQuote[]) {
   })
 }
 
+function formatFreshnessLabel(label: string, freshness: FreshnessStatus | EpsFreshnessStatus) {
+  if (freshness.updatedLabel) {
+    return `${label}: ${freshness.updatedLabel}${freshness.stale ? ' (refreshing)' : ''}`
+  }
+
+  return `${label}: warming cache`
+}
+
 function App() {
   const [payload, setPayload] = useState<StocksPayload | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [isRefreshing, setIsRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [statusMessage, setStatusMessage] = useState('Loading live stock prices...')
-  const timeoutRefs = useRef<Array<ReturnType<typeof setTimeout>>>([])
 
   const stocks = useMemo(() => sortByHighProximity(payload?.stocks ?? []), [payload])
 
-  const clearScheduledRefreshes = useCallback(() => {
-    for (const timeoutId of timeoutRefs.current) {
-      clearTimeout(timeoutId)
+  const loadStocks = useCallback(async ({ refresh = false } = {}) => {
+    if (refresh) {
+      setIsRefreshing(true)
+    } else {
+      setIsLoading(true)
     }
 
-    timeoutRefs.current = []
-  }, [])
-
-  const loadStocks = useCallback(async ({ refresh = false, stage = 'all' as LoadStage } = {}) => {
-    setIsLoading(true)
     setError(null)
 
     try {
-      const params = new URLSearchParams()
-
-      if (refresh) {
-        params.set('refresh', 'true')
-      }
-
-      params.set('stage', stage)
-
-      const response = await fetch(`/api/stocks?${params.toString()}`, {
+      const response = await fetch(refresh ? '/api/stocks?refresh=true' : '/api/stocks', {
         cache: 'no-store',
       })
       const nextPayload = (await response.json()) as StocksPayload | ApiErrorPayload
@@ -120,91 +132,65 @@ function App() {
         throw new Error([apiError.error, apiError.hint].filter(Boolean).join(' '))
       }
 
-      const resolvedPayload = nextPayload as StocksPayload
-      setPayload(resolvedPayload)
-      return resolvedPayload
+      setPayload(nextPayload as StocksPayload)
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Unable to load stock data.')
-      return null
     } finally {
       setIsLoading(false)
+      setIsRefreshing(false)
     }
   }, [])
 
-  const startStagedRefresh = useCallback(async () => {
-    clearScheduledRefreshes()
-    setStatusMessage('Loading live stock prices...')
-
-    const quotesPayload = await loadStocks({ refresh: true, stage: 'quotes' })
-
-    if (!quotesPayload) {
-      return
-    }
-
-    setStatusMessage(
-      'EPS and Market Cap values will be fetched automatically in another 2 minutes.',
-    )
-
-    const marketCapTimeout = setTimeout(async () => {
-      setStatusMessage('Fetching live Market Cap data...')
-      const marketCapPayload = await loadStocks({ refresh: true, stage: 'market-cap' })
-
-      if (!marketCapPayload) {
-        return
-      }
-
-      setStatusMessage(
-        'Stock and Market Cap data is accurate, and the app will next fetch EPS data.',
-      )
-
-      const epsTimeout = setTimeout(async () => {
-        setStatusMessage('Fetching live EPS data...')
-        const epsPayload = await loadStocks({ refresh: true, stage: 'eps' })
-
-        if (!epsPayload) {
-          return
-        }
-
-        setStatusMessage('All data is current.')
-      }, 65000)
-
-      timeoutRefs.current.push(epsTimeout)
-    }, 65000)
-
-    timeoutRefs.current.push(marketCapTimeout)
-  }, [clearScheduledRefreshes, loadStocks])
-
   useEffect(() => {
-    startStagedRefresh()
+    loadStocks()
+
+    const refreshTimer = setInterval(() => {
+      void loadStocks()
+    }, 60000)
 
     return () => {
-      clearScheduledRefreshes()
+      clearInterval(refreshTimer)
     }
-  }, [clearScheduledRefreshes, startStagedRefresh])
+  }, [loadStocks])
+
+  const quoteSummary = payload ? formatFreshnessLabel('Quotes', payload.freshness.quotes) : 'Quotes: warming cache'
+  const marketCapSummary = payload
+    ? payload.freshness.marketCap.missingCount > 0
+      ? `Market Cap: ${payload.stocks.length - payload.freshness.marketCap.missingCount}/${payload.stocks.length} ready`
+      : formatFreshnessLabel('Market Cap', payload.freshness.marketCap)
+    : 'Market Cap: warming cache'
+  const epsSummary = payload
+    ? payload.freshness.eps.missingCount > 0
+      ? `EPS: ${payload.stocks.length - payload.freshness.eps.missingCount}/${payload.stocks.length} ready`
+      : formatFreshnessLabel('EPS', payload.freshness.eps)
+    : 'EPS: warming cache'
 
   return (
     <main>
       <header className="page-header">
         <div className="header-inner">
           <div>
-            <p className="eyebrow">Twelve Data Market View</p>
+            <p className="eyebrow">Server-Managed Stock Cache</p>
             <h1>52-Week Stock Position</h1>
             <p className="updated-at">
-              {payload?.updatedLabel ? `Latest refresh: ${payload.updatedLabel}` : 'Loading market data...'}
-              {payload?.cached ? ' · cached' : ''}
+              {payload?.updatedLabel ? `Latest quote refresh: ${payload.updatedLabel}` : 'Loading market data...'}
             </p>
-            <p className="status-message">{statusMessage}</p>
+            <p className="status-message">
+              {payload?.statusHeadline ?? 'Loading live stock prices into the shared cache.'}
+            </p>
+            {payload?.statusDetail ? <p className="status-detail">{payload.statusDetail}</p> : null}
             {payload?.warning ? <p className="warning-text">{payload.warning}</p> : null}
+            {error ? <p className="warning-text">{error}</p> : null}
           </div>
 
           <button
             className="refresh-button"
             type="button"
-            onClick={() => startStagedRefresh()}
-            disabled={isLoading}
+            onClick={() => void loadStocks({ refresh: true })}
+            disabled={isRefreshing}
           >
-            <RefreshCcw size={18} className={isLoading ? 'spin' : undefined} />
-            {isLoading ? 'Refreshing' : 'Refresh'}
+            <RefreshCcw size={18} className={isRefreshing ? 'spin' : undefined} />
+            {isRefreshing ? 'Refreshing' : 'Refresh Quotes'}
           </button>
         </div>
       </header>
@@ -213,13 +199,28 @@ function App() {
         <div className="status-strip">
           <span>
             <Server size={16} />
-            {payload?.source ? `${payload.source} loaded server-side` : 'Twelve Data loaded server-side'}
+            {payload?.source ?? 'Shared cache warming on the server'}
           </span>
-          <span>
+          <span className={payload?.freshness.quotes.stale ? 'status-pill stale' : 'status-pill'}>
             <TrendingUp size={16} />
-            Sorted closest to 52-week high
+            {quoteSummary}
+          </span>
+          <span className={payload?.freshness.marketCap.missingCount ? 'status-pill stale' : 'status-pill'}>
+            <DatabaseZap size={16} />
+            {marketCapSummary}
+          </span>
+          <span className={payload?.freshness.eps.missingCount ? 'status-pill stale' : 'status-pill'}>
+            <DatabaseZap size={16} />
+            {epsSummary}
           </span>
         </div>
+
+        {payload?.freshness.eps.nextSymbols.length ? (
+          <p className="queue-text">
+            Next EPS refresh batch: {payload.freshness.eps.nextSymbols.join(', ')}. The server refreshes up to{' '}
+            {payload.freshness.eps.batchSize} symbol{payload.freshness.eps.batchSize === 1 ? '' : 's'} per minute.
+          </p>
+        ) : null}
 
         <section className="table-shell" aria-label="52-week stock position table">
           <div className="table-grid table-head" role="row">
@@ -234,10 +235,8 @@ function App() {
             <div className="message-row">Loading latest stock data...</div>
           ) : null}
 
-          {error ? <div className="message-row error-row">{error}</div> : null}
-
-          {!isLoading && !error && stocks.length === 0 ? (
-            <div className="message-row">No stocks are configured.</div>
+          {!isLoading && !payload && !error ? (
+            <div className="message-row">No cached stock payload is available yet.</div>
           ) : null}
 
           {stocks.map((stock) => {

@@ -50,6 +50,7 @@ h1 {
 
 .updated-at,
 .status-message,
+.status-detail,
 .warning-text {
   margin: 10px 0 0;
   font-size: 0.9rem;
@@ -63,6 +64,11 @@ h1 {
   max-width: 760px;
   color: rgba(217, 239, 171, 0.98);
   font-weight: 700;
+}
+
+.status-detail {
+  max-width: 760px;
+  color: rgba(255, 255, 255, 0.82);
 }
 
 .warning-text {
@@ -128,6 +134,19 @@ h1 {
   background: var(--surface);
   font-size: 0.84rem;
   font-weight: 700;
+}
+
+.status-pill.stale {
+  border-color: rgba(118, 185, 0, 0.35);
+  color: var(--text);
+  background: #eef7db;
+}
+
+.queue-text {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 0.92rem;
+  font-weight: 600;
 }
 
 .table-shell {
