@@ -74,6 +74,16 @@ function formatEps(value: number | null) {
   return typeof value === 'number' ? value.toFixed(2) : 'N/A'
 }
 
+function formatCompanyLabel(stock: StockQuote) {
+  const normalizedName = stock.name.trim()
+
+  if (!normalizedName || normalizedName.toUpperCase() === stock.symbol) {
+    return stock.symbol
+  }
+
+  return `${normalizedName} (${stock.symbol})`
+}
+
 function clampPercent(value: number | null) {
   if (typeof value !== 'number') {
     return 0
@@ -224,8 +234,7 @@ function App() {
 
         <section className="table-shell" aria-label="52-week stock position table">
           <div className="table-grid table-head" role="row">
-            <span>Stock Ticker</span>
-            <span>Stock Name</span>
+            <span>Stock</span>
             <span>EPS</span>
             <span>Market Cap</span>
             <span>52-Week Position</span>
@@ -253,11 +262,10 @@ function App() {
 
             return (
               <article className="table-grid stock-row" key={stock.symbol}>
-                <div className="ticker-cell">
-                  <strong>{stock.symbol}</strong>
+                <div className="company-cell">
+                  <strong>{formatCompanyLabel(stock)}</strong>
                   {stock.exchange ? <small>{stock.exchange}</small> : null}
                 </div>
-                <div className="company-cell">{stock.name}</div>
                 <div className="number-cell">{formatEps(stock.eps)}</div>
                 <div className="number-cell">{formatMarketCap(stock.marketCap)}</div>
                 <div className="slider-cell">
