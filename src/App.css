@@ -52,6 +52,7 @@ h1 {
 .status-message,
 .status-detail,
 .stage-detail,
+.sort-detail,
 .warning-text {
   margin: 10px 0 0;
   font-size: 0.9rem;
@@ -76,6 +77,12 @@ h1 {
   max-width: 760px;
   color: rgba(255, 255, 255, 0.7);
   font-weight: 600;
+}
+
+.sort-detail {
+  max-width: 760px;
+  color: rgba(255, 255, 255, 0.74);
+  font-weight: 700;
 }
 
 .warning-text {
@@ -176,6 +183,48 @@ h1 {
   font-size: 0.88rem;
 }
 
+.sort-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.sort-controls-label {
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.sort-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 8px 12px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 0.84rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease,
+    color 140ms ease;
+}
+
+.sort-chip:hover,
+.header-sort:hover {
+  border-color: rgba(118, 185, 0, 0.45);
+  color: var(--text);
+}
+
+.sort-chip.active,
+.header-sort.active {
+  border-color: rgba(118, 185, 0, 0.4);
+  color: var(--text);
+  background: #eef7db;
+}
+
 .table-shell {
   overflow: hidden;
   border: 1px solid var(--border);
@@ -204,6 +253,26 @@ h1 {
   font-weight: 800;
   letter-spacing: 0;
   text-transform: uppercase;
+}
+
+.header-sort {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.header-sort-arrow {
+  min-width: 12px;
+  color: var(--green);
 }
 
 .stock-row {
@@ -359,6 +428,10 @@ h1 {
 
   .table-head {
     display: none;
+  }
+
+  .sort-controls {
+    margin-bottom: 12px;
   }
 
   .table-grid,

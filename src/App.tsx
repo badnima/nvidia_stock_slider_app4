@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { DatabaseZap, RefreshCcw, Server, TrendingUp } from 'lucide-react'
 import './App.css'
 
+type SortMetric = 'positionPercent' | 'eps' | 'peRatio' | 'marketCap'
+
 type StockQuote = {
   symbol: string
   name: string
@@ -114,18 +116,31 @@ function clampPercent(value: number | null) {
   return Math.min(100, Math.max(0, value))
 }
 
-function sortByHighProximity(stocks: StockQuote[]) {
+function sortStocks(stocks: StockQuote[], sortMetric: SortMetric) {
   return [...stocks].sort((left, right) => {
-    const leftPosition = typeof left.positionPercent === 'number' ? left.positionPercent : -Infinity
-    const rightPosition =
-      typeof right.positionPercent === 'number' ? right.positionPercent : -Infinity
+    const leftValue = typeof left[sortMetric] === 'number' ? left[sortMetric] : -Infinity
+    const rightValue = typeof right[sortMetric] === 'number' ? right[sortMetric] : -Infinity
 
-    if (rightPosition !== leftPosition) {
-      return rightPosition - leftPosition
+    if (rightValue !== leftValue) {
+      return rightValue - leftValue
     }
 
     return left.symbol.localeCompare(right.symbol)
   })
+}
+
+function formatSortMetricLabel(sortMetric: SortMetric) {
+  switch (sortMetric) {
+    case 'eps':
+      return 'EPS'
+    case 'peRatio':
+      return 'P/E'
+    case 'marketCap':
+      return 'Market Cap'
+    case 'positionPercent':
+    default:
+      return '52-Week Position'
+  }
 }
 
 function formatFreshnessLabel(label: string, freshness: FreshnessStatus | EpsFreshnessStatus) {
@@ -141,8 +156,9 @@ function App() {
   const [isLoading, setIsLoading] = useState(true)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [sortMetric, setSortMetric] = useState<SortMetric>('positionPercent')
 
-  const stocks = useMemo(() => sortByHighProximity(payload?.stocks ?? []), [payload])
+  const stocks = useMemo(() => sortStocks(payload?.stocks ?? [], sortMetric), [payload, sortMetric])
 
   const loadStocks = useCallback(async ({ refresh = false } = {}) => {
     if (refresh) {
@@ -204,6 +220,14 @@ function App() {
   const stageSummary = payload?.readyCounts
     ? `${payload.readyCounts.quotes}/${payload.readyCounts.total} prices · ${payload.readyCounts.marketCap}/${payload.readyCounts.total} Market Cap · ${payload.readyCounts.eps}/${payload.readyCounts.total} EPS · ${payload.readyCounts.peRatio}/${payload.readyCounts.total} P/E`
     : 'Building live data in stages'
+  const sortSummary = `Sorted high to low by ${formatSortMetricLabel(sortMetric)}`
+
+  const sortableColumns: Array<{ key: SortMetric; label: string }> = [
+    { key: 'eps', label: 'EPS' },
+    { key: 'peRatio', label: 'P/E' },
+    { key: 'marketCap', label: 'Market Cap' },
+    { key: 'positionPercent', label: '52-Week Position' },
+  ]
 
   return (
     <main>
@@ -220,6 +244,7 @@ function App() {
             </p>
             {payload?.statusDetail ? <p className="status-detail">{payload.statusDetail}</p> : null}
             <p className="stage-detail">{stageSummary}</p>
+            <p className="sort-detail">{sortSummary}</p>
             {payload?.warning ? <p className="warning-text">{payload.warning}</p> : null}
             {error ? <p className="warning-text">{error}</p> : null}
           </div>
@@ -276,13 +301,37 @@ function App() {
           </div>
         ) : null}
 
+        <div className="sort-controls" aria-label="Sort stocks by metric">
+          <span className="sort-controls-label">Sort high to low:</span>
+          {sortableColumns.map((column) => (
+            <button
+              key={column.key}
+              type="button"
+              className={sortMetric === column.key ? 'sort-chip active' : 'sort-chip'}
+              onClick={() => setSortMetric(column.key)}
+            >
+              {column.label}
+            </button>
+          ))}
+        </div>
+
         <section className="table-shell" aria-label="52-week stock position table">
           <div className="table-grid table-head" role="row">
             <span>Stock</span>
-            <span>EPS</span>
-            <span>P/E</span>
-            <span>Market Cap</span>
-            <span>52-Week Position</span>
+            {sortableColumns.map((column) => (
+              <button
+                key={column.key}
+                type="button"
+                className={sortMetric === column.key ? 'header-sort active' : 'header-sort'}
+                onClick={() => setSortMetric(column.key)}
+                aria-pressed={sortMetric === column.key}
+              >
+                {column.label}
+                <span className="header-sort-arrow" aria-hidden="true">
+                  {sortMetric === column.key ? '↓' : ''}
+                </span>
+              </button>
+            ))}
           </div>
 
           {isLoading && !payload ? (
