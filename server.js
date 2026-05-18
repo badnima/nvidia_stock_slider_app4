@@ -25,11 +25,17 @@ const marketCapCacheTtlMs =
     process.env.FMP_MARKET_CAP_CACHE_SECONDS || process.env.TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS,
     86400,
   ) * 1000
+const marketCapPartialRetryMs =
+  parsePositiveInt(process.env.FMP_MARKET_CAP_PARTIAL_RETRY_SECONDS, 900) * 1000
+const marketCapFailureRetryMs =
+  parsePositiveInt(process.env.FMP_MARKET_CAP_FAILURE_RETRY_SECONDS, 3600) * 1000
+const marketCapRateLimitRetryMs =
+  parsePositiveInt(process.env.FMP_MARKET_CAP_RATE_LIMIT_RETRY_SECONDS, 43200) * 1000
 const epsCacheTtlMs = parsePositiveInt(process.env.TWELVE_DATA_EPS_CACHE_SECONDS, 604800) * 1000
 const backgroundRefreshIntervalMs =
   parsePositiveInt(process.env.BACKGROUND_REFRESH_INTERVAL_SECONDS, 60) * 1000
 const epsBatchSize = parsePositiveInt(process.env.TWELVE_DATA_EPS_BATCH_SIZE, 1)
-const marketCapProfileBatchSize = parsePositiveInt(process.env.FMP_MARKET_CAP_PROFILE_BATCH_SIZE, 4)
+const marketCapProfileBatchSize = parsePositiveInt(process.env.FMP_MARKET_CAP_PROFILE_BATCH_SIZE, 2)
 
 let keyValueClient = null
 let keyValueConnectPromise = null
@@ -849,10 +855,29 @@ function marketCapNeedsRefresh(state, symbols, nowMs, force = false) {
   })
 
   if (hasMissingMarketCap) {
-    return true
+    const retryWindowMs = marketCapRetryWindowMs(state.jobs.marketCap.lastError)
+    return !isFresh(state.jobs.marketCap.lastAttemptAt, retryWindowMs, nowMs)
   }
 
   return !isFresh(state.jobs.marketCap.lastSuccessAt, marketCapCacheTtlMs, nowMs)
+}
+
+function marketCapRetryWindowMs(lastError) {
+  const message = readString(lastError)
+
+  if (!message) {
+    return marketCapPartialRetryMs
+  }
+
+  if (message.includes('429') || message.includes('API credits') || message.includes('Limit Reach')) {
+    return marketCapRateLimitRetryMs
+  }
+
+  if (message.includes('still do not have market cap data cached')) {
+    return marketCapPartialRetryMs
+  }
+
+  return marketCapFailureRetryMs
 }
 
 function epsNeedsRefresh(fundamental, nowMs) {
@@ -963,6 +988,17 @@ async function refreshQuotes(state, symbols, { force = false } = {}) {
         readString(nextQuote.exchange) ||
         readString(nextQuote.mic_code) ||
         fundamental.exchange
+
+      const quotedMarketCap = firstNumber(
+        nextQuote.market_capitalization,
+        nextQuote.marketCap,
+        nextQuote.market_cap,
+      )
+
+      if (quotedMarketCap !== null) {
+        fundamental.marketCap = quotedMarketCap
+        fundamental.marketCapFetchedAt = new Date().toISOString()
+      }
     }
 
     state.jobs.quotes.lastSuccessAt = new Date().toISOString()
