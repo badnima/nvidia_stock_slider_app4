@@ -29,6 +29,7 @@ const epsCacheTtlMs = parsePositiveInt(process.env.TWELVE_DATA_EPS_CACHE_SECONDS
 const backgroundRefreshIntervalMs =
   parsePositiveInt(process.env.BACKGROUND_REFRESH_INTERVAL_SECONDS, 60) * 1000
 const epsBatchSize = parsePositiveInt(process.env.TWELVE_DATA_EPS_BATCH_SIZE, 1)
+const marketCapProfileBatchSize = parsePositiveInt(process.env.FMP_MARKET_CAP_PROFILE_BATCH_SIZE, 4)
 
 let keyValueClient = null
 let keyValueConnectPromise = null
@@ -504,9 +505,12 @@ function normalizeQuote(symbol, quote, fundamentals) {
     readString(quote?.companyName) ||
     readString(fundamentals?.name) ||
     symbol
+  const computedPeRatio =
+    typeof currentPrice === 'number' && typeof eps === 'number' && eps > 0 ? currentPrice / eps : null
+  const providerPeRatio = firstNumber(quote?.pe, quote?.pe_ratio, quote?.price_earnings_ratio)
   const peRatio =
-    firstNumber(quote?.pe, quote?.pe_ratio, quote?.price_earnings_ratio) ??
-    (typeof currentPrice === 'number' && typeof eps === 'number' && eps > 0 ? currentPrice / eps : null)
+    providerPeRatio ??
+    computedPeRatio
 
   const normalized = {
     symbol,
@@ -703,27 +707,60 @@ async function fetchEarnings(symbol, apiKey) {
 
 function extractBatchMarketCaps(symbols, body) {
   const bySymbol = new Map()
-  const rows = Array.isArray(body) ? body : Object.values(body || {})
 
-  for (const row of rows) {
-    if (!row || typeof row !== 'object') {
-      continue
+  const pushMarketCap = (candidate, fallbackSymbol = null) => {
+    if (!candidate || typeof candidate !== 'object') {
+      return
     }
 
-    const symbol = readString(row.symbol)?.toUpperCase()
+    const nested = candidate.data && typeof candidate.data === 'object' ? candidate.data : candidate
+    const symbol =
+      readString(nested?.symbol)?.toUpperCase() ||
+      readString(fallbackSymbol)?.toUpperCase() ||
+      null
     const marketCap = firstNumber(
-      row.marketCap,
-      row.market_cap,
-      row.marketCapitalization,
-      row.capitalization,
-      row.value,
+      nested?.marketCap,
+      nested?.market_cap,
+      nested?.marketCapitalization,
+      nested?.marketCapInUsd,
+      nested?.marketCapUsd,
+      nested?.mktCap,
+      nested?.capitalization,
+      nested?.value,
     )
 
     if (!symbol || marketCap === null || !symbols.includes(symbol)) {
-      continue
+      return
     }
 
     bySymbol.set(symbol, marketCap)
+  }
+
+  if (Array.isArray(body)) {
+    for (const row of body) {
+      pushMarketCap(row)
+    }
+
+    return bySymbol
+  }
+
+  if (!body || typeof body !== 'object') {
+    return bySymbol
+  }
+
+  if (body.status === 'ok' && body.data) {
+    return extractBatchMarketCaps(symbols, body.data)
+  }
+
+  pushMarketCap(body)
+
+  for (const [key, value] of Object.entries(body)) {
+    if (key === 'status' || key === 'code' || key === 'message' || key === 'Error Message') {
+      continue
+    }
+
+    const fallbackSymbol = symbols.includes(key.toUpperCase()) ? key : null
+    pushMarketCap(value, fallbackSymbol)
   }
 
   return bySymbol
@@ -740,6 +777,57 @@ async function fetchBatchMarketCaps(symbols, apiKey) {
 
   const body = await fetchFmpJson(url, `FMP batch market cap (${symbols.length} symbols)`)
   return extractBatchMarketCaps(symbols, body)
+}
+
+function extractProfileMarketCap(body) {
+  const rows = Array.isArray(body) ? body : [body]
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') {
+      continue
+    }
+
+    const nested = row.data && typeof row.data === 'object' ? row.data : row
+    const profile =
+      Array.isArray(nested.profile) && nested.profile.length
+        ? nested.profile[0]
+        : nested.profile && typeof nested.profile === 'object'
+          ? nested.profile
+          : nested
+    const marketCap = firstNumber(
+      profile?.marketCap,
+      profile?.market_cap,
+      profile?.marketCapitalization,
+      profile?.marketCapInUsd,
+      profile?.marketCapUsd,
+      profile?.mktCap,
+    )
+
+    if (marketCap === null) {
+      continue
+    }
+
+    return {
+      marketCap,
+      name: readString(profile?.companyName) || readString(profile?.name),
+      exchange: readString(profile?.exchangeShortName) || readString(profile?.exchange),
+    }
+  }
+
+  return {
+    marketCap: null,
+    name: null,
+    exchange: null,
+  }
+}
+
+async function fetchProfileMarketCap(symbol, apiKey) {
+  const url = new URL('https://financialmodelingprep.com/stable/profile')
+  url.searchParams.set('symbol', symbol)
+  url.searchParams.set('apikey', apiKey)
+
+  const body = await fetchFmpJson(url, `FMP profile ${symbol}`)
+  return extractProfileMarketCap(body)
 }
 
 function quoteNeedsRefresh(state, nowMs, force = false) {
@@ -827,6 +915,14 @@ function summarizeBackgroundFailure(label, errorMessage) {
     return `${label} refresh was rejected by the provider. Check your API plan and permissions.`
   }
 
+  if (message.includes('still do not have market cap data cached')) {
+    return `${label} refresh is still warming the remaining symbols in the background.`
+  }
+
+  if (message.includes('returned no usable market cap values')) {
+    return `${label} refresh returned no usable values. The server will retry automatically.`
+  }
+
   return `${label} refresh failed and will retry automatically.`
 }
 
@@ -895,6 +991,35 @@ async function refreshMarketCaps(state, symbols, { force = false } = {}) {
 
   try {
     const marketCapsBySymbol = await fetchBatchMarketCaps(symbols, apiKey)
+    const fetchedAt = new Date().toISOString()
+    const fallbackErrors = []
+    const fallbackSymbols = symbols
+      .filter((symbol) => marketCapsBySymbol.get(symbol) === undefined)
+      .slice(0, marketCapProfileBatchSize)
+
+    for (const symbol of fallbackSymbols) {
+      try {
+        const profileData = await fetchProfileMarketCap(symbol, apiKey)
+
+        if (profileData.marketCap === null) {
+          continue
+        }
+
+        marketCapsBySymbol.set(symbol, profileData.marketCap)
+
+        const fundamental = getOrCreateFundamental(state, symbol)
+        fundamental.name = profileData.name || fundamental.name
+        fundamental.exchange = profileData.exchange || fundamental.exchange
+      } catch (error) {
+        fallbackErrors.push(
+          `${symbol}: ${error instanceof Error ? error.message : 'Unknown FMP profile refresh error'}`,
+        )
+      }
+    }
+
+    if (!marketCapsBySymbol.size) {
+      throw new Error('FMP batch market cap returned no usable market cap values.')
+    }
 
     for (const symbol of symbols) {
       const fundamental = getOrCreateFundamental(state, symbol)
@@ -902,13 +1027,22 @@ async function refreshMarketCaps(state, symbols, { force = false } = {}) {
 
       if (nextMarketCap !== undefined) {
         fundamental.marketCap = nextMarketCap
+        fundamental.marketCapFetchedAt = fetchedAt
       }
-
-      fundamental.marketCapFetchedAt = new Date().toISOString()
     }
 
-    state.jobs.marketCap.lastSuccessAt = new Date().toISOString()
-    state.jobs.marketCap.lastError = null
+    const remainingMissingCount = symbols.filter(
+      (symbol) => numberOrNull(state.fundamentalsBySymbol[symbol]?.marketCap) === null,
+    ).length
+
+    state.jobs.marketCap.lastSuccessAt = fetchedAt
+    state.jobs.marketCap.lastError = fallbackErrors[0]
+      ? `${fallbackErrors.length} FMP profile market cap requests failed (${fallbackErrors
+          .slice(0, 2)
+          .join('; ')}).`
+      : remainingMissingCount > 0
+        ? `${remainingMissingCount} configured symbols still do not have market cap data cached from FMP yet.`
+        : null
     return true
   } catch (error) {
     state.jobs.marketCap.lastError =
