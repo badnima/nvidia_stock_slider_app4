@@ -211,7 +211,7 @@ function App() {
         <div className="header-inner">
           <div>
             <p className="eyebrow">Server-Managed Stock Cache</p>
-            <h1>Nima's Stock Tracker (52-Week Stock Position)</h1>
+            <h1>Nima's Stock Tracker (52-Week)</h1>
             <p className="updated-at">
               {payload?.updatedLabel ? `Latest quote refresh: ${payload.updatedLabel}` : 'Loading market data...'}
             </p>
