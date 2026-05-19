@@ -7,30 +7,29 @@ A Render-ready React + Express stock dashboard that is built around a shared ser
 This app now treats each data type according to how often it really changes:
 
 - **Quotes** come from Twelve Data and refresh about once per minute.
-- **Market Cap** comes from FMP and refreshes on a daily cache window.
-- **EPS** comes from Twelve Data earnings and refreshes slowly in a throttled background queue.
+- **Market Cap, EPS, and P/E** come from a published Google Sheet snapshot and refresh on a server cache window.
 
-The browser only requests one cached payload from `/api/stocks`. It no longer tries to fetch quote, Market Cap, and EPS data directly in sequence.
+The browser only requests one cached payload from `/api/stocks`. The server merges live Twelve Data quotes with the latest cached Google Sheet fundamentals snapshot.
 
 ## Why This Architecture Works Better
 
 - It respects your **55 Twelve Data credits per minute** limit.
-- Quotes stay fresh without spending credits on fundamentals every page load.
-- EPS warming is gradual, so the app no longer blows through the limit on cold start.
+- Quotes stay fresh without spending Twelve Data credits on fundamentals every page load.
+- Market Cap, EPS, and P/E are no longer blocked by the free FMP tier running out.
 - The last good payload is persisted in **Render Key Value**, so a Render spin-down does not erase the cache.
 
 ## Cache Strategy
 
 - **Hot cache**: Render Key Value via `RENDER_KEY_VALUE_URL`
 - **Local fallback**: `.stock-cache.json`
-- **Shared payload**: the server merges quotes, Market Cap, and EPS into one response for the frontend
+- **Shared payload**: the server merges quotes plus Google Sheet snapshot fundamentals into one response for the frontend
 
-This app does **not** use a Google Doc or Google Sheet as the primary cache. Those are a poor fit for high-frequency server reads/writes and concurrent refreshes. Render Key Value is the correct primary cache for this deployment.
+Render Key Value remains the primary runtime cache. The Google Sheet is the fundamentals source of truth, not the hot cache.
 
 ## Provider Layout
 
-- **Twelve Data**: quotes and EPS earnings history
-- **FMP**: batch Market Cap
+- **Twelve Data**: `currentPrice`, `week52High`, `week52Low`
+- **Google Sheet snapshot**: `marketCap`, `eps`, `pe`
 
 ## Local Run
 
@@ -47,7 +46,7 @@ For local live data, create a `.env` file from `.env.example`.
 ## Required Environment Variables
 
 - `TWELVE_DATA_API_KEY`
-- `FMP_API_KEY`
+- `GOOGLE_SHEETS_SNAPSHOT_URL`
 - `RENDER_KEY_VALUE_URL`
 
 ## Optional Environment Variables
@@ -55,26 +54,61 @@ For local live data, create a `.env` file from `.env.example`.
 - `TWELVE_DATA_QUOTE_CACHE_SECONDS`
   - Default: `60`
   - How long quotes stay fresh before the server refreshes them.
-- `FMP_MARKET_CAP_CACHE_SECONDS`
-  - Default: `86400`
-  - How long Market Cap stays fresh before the server refreshes it.
-- `TWELVE_DATA_EPS_CACHE_SECONDS`
-  - Default: `604800`
-  - How long EPS stays fresh before the background queue revisits it.
-- `TWELVE_DATA_EPS_BATCH_SIZE`
-  - Default: `1`
-  - How many symbols the background EPS queue refreshes per minute.
+- `GOOGLE_SHEETS_SNAPSHOT_CACHE_SECONDS`
+  - Default: `900`
+  - How long the Google Sheet snapshot stays fresh before the server refetches it.
+- `GOOGLE_SHEETS_PARTIAL_RETRY_SECONDS`
+  - Default: `900`
+  - How long the server waits before retrying a snapshot that still has blanks.
+- `GOOGLE_SHEETS_FAILURE_RETRY_SECONDS`
+  - Default: `3600`
+  - How long the server waits before retrying a failed snapshot fetch.
 - `BACKGROUND_REFRESH_INTERVAL_SECONDS`
   - Default: `60`
   - How often the server wakes up its background refresh loop.
+
+## Google Sheet Snapshot Format
+
+Point `GOOGLE_SHEETS_SNAPSHOT_URL` at a published CSV or JSON endpoint that contains one row per symbol.
+
+Required column:
+- `symbol`
+
+Supported fundamentals columns:
+- `marketCap`
+- `eps`
+- `pe`
+
+Optional columns:
+- `name`
+- `exchange`
+
+Example CSV:
+
+```csv
+symbol,marketCap,eps,pe
+NVDA,3298000000000,1.62,137.17
+MSFT,3124000000000,16.19,26.05
+ASML,577000000000,30.04,48.92
+```
+
+Example JSON:
+
+```json
+{
+  "updatedAt": "2026-05-19T15:45:00.000Z",
+  "rows": [
+    { "symbol": "NVDA", "marketCap": 3298000000000, "eps": 1.62, "pe": 137.17 }
+  ]
+}
+```
 
 ## How The App Refreshes
 
 1. The first request returns a staged placeholder payload immediately if the cache is cold.
 2. Quotes warm first in the background.
-3. Market Cap refreshes only when missing or stale.
-4. EPS refreshes in a slow queue, one symbol at a time by default.
-5. The frontend polls the cached payload frequently so the page fills itself in as each cache stage completes.
+3. The Google Sheet snapshot refreshes only when missing or stale.
+4. The frontend polls the cached payload frequently so the page fills itself in as each cache stage completes.
 
 This keeps the page responsive while still allowing the fundamentals cache to fill in over time.
 
@@ -92,6 +126,5 @@ The web service receives `RENDER_KEY_VALUE_URL` automatically from that Key Valu
 Open `/api/stocks` on the deployed Render URL.
 
 - If quotes are missing, confirm `TWELVE_DATA_API_KEY`.
-- If Market Cap is missing, confirm `FMP_API_KEY`.
-- If the app says EPS is still warming, that is expected on a cold cache. The server will keep filling it in automatically.
+- If Market Cap, EPS, or P/E are missing, confirm `GOOGLE_SHEETS_SNAPSHOT_URL` and make sure the snapshot endpoint is public and returning values.
 - If Render Key Value is unavailable, confirm `RENDER_KEY_VALUE_URL` is populated from the Key Value service.

@@ -17,25 +17,22 @@ const quoteCacheTtlMs =
   parsePositiveInt(
     process.env.TWELVE_DATA_QUOTE_CACHE_SECONDS ||
       process.env.TWELVE_DATA_CACHE_TTL_SECONDS ||
-      process.env.FMP_CACHE_TTL_SECONDS,
+      process.env.GOOGLE_SHEETS_CACHE_TTL_SECONDS,
     60,
   ) * 1000
-const marketCapCacheTtlMs =
+const fundamentalsCacheTtlMs =
   parsePositiveInt(
-    process.env.FMP_MARKET_CAP_CACHE_SECONDS || process.env.TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS,
-    86400,
+    process.env.GOOGLE_SHEETS_SNAPSHOT_CACHE_SECONDS ||
+      process.env.GOOGLE_SHEET_SNAPSHOT_CACHE_SECONDS ||
+      process.env.TWELVE_DATA_FUNDAMENTALS_CACHE_SECONDS,
+    900,
   ) * 1000
-const marketCapPartialRetryMs =
-  parsePositiveInt(process.env.FMP_MARKET_CAP_PARTIAL_RETRY_SECONDS, 900) * 1000
-const marketCapFailureRetryMs =
-  parsePositiveInt(process.env.FMP_MARKET_CAP_FAILURE_RETRY_SECONDS, 3600) * 1000
-const marketCapRateLimitRetryMs =
-  parsePositiveInt(process.env.FMP_MARKET_CAP_RATE_LIMIT_RETRY_SECONDS, 43200) * 1000
-const epsCacheTtlMs = parsePositiveInt(process.env.TWELVE_DATA_EPS_CACHE_SECONDS, 604800) * 1000
+const fundamentalsPartialRetryMs =
+  parsePositiveInt(process.env.GOOGLE_SHEETS_PARTIAL_RETRY_SECONDS, 900) * 1000
+const fundamentalsFailureRetryMs =
+  parsePositiveInt(process.env.GOOGLE_SHEETS_FAILURE_RETRY_SECONDS, 3600) * 1000
 const backgroundRefreshIntervalMs =
   parsePositiveInt(process.env.BACKGROUND_REFRESH_INTERVAL_SECONDS, 60) * 1000
-const epsBatchSize = parsePositiveInt(process.env.TWELVE_DATA_EPS_BATCH_SIZE, 1)
-const marketCapProfileBatchSize = parsePositiveInt(process.env.FMP_MARKET_CAP_PROFILE_BATCH_SIZE, 2)
 
 let keyValueClient = null
 let keyValueConnectPromise = null
@@ -64,11 +61,31 @@ function numberOrNull(value) {
   if (typeof rawValue === 'string') {
     const normalized = rawValue.trim().replaceAll(',', '')
 
-    if (!normalized || normalized === '--' || normalized.toUpperCase() === 'N/A') {
+    if (
+      !normalized ||
+      normalized === '--' ||
+      normalized.startsWith('#') ||
+      normalized.toUpperCase() === 'N/A'
+    ) {
       return null
     }
 
-    const parsed = Number(normalized)
+    const suffixMatch = normalized.match(/^(-?[\d.]+)\s*([KMBT])$/i)
+    if (suffixMatch) {
+      const base = Number(suffixMatch[1])
+      const multiplier = {
+        K: 1e3,
+        M: 1e6,
+        B: 1e9,
+        T: 1e12,
+      }[suffixMatch[2].toUpperCase()]
+
+      if (Number.isFinite(base) && multiplier) {
+        return base * multiplier
+      }
+    }
+
+    const parsed = Number(normalized.replaceAll('$', '').replaceAll('%', ''))
     return Number.isFinite(parsed) ? parsed : null
   }
 
@@ -89,6 +106,20 @@ function firstNumber(...values) {
 
 function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function normalizeSymbolValue(value) {
+  const normalized = readString(value)?.toUpperCase()
+
+  if (!normalized) {
+    return null
+  }
+
+  if (normalized.includes(':')) {
+    return normalized.split(':').at(-1) || null
+  }
+
+  return normalized
 }
 
 function parseRange(value) {
@@ -143,11 +174,11 @@ function getTwelveDataApiKey() {
   return process.env.TWELVE_DATA_API_KEY || process.env.TWELVE_DATA_KEY || null
 }
 
-function getFmpApiKey() {
+function getGoogleSheetsSnapshotUrl() {
   return (
-    process.env.FMP_API_KEY ||
-    process.env.FINANCIAL_MODELING_PREP_API_KEY ||
-    process.env.FINANCIALMODELINGPREP_API_KEY ||
+    process.env.GOOGLE_SHEETS_SNAPSHOT_URL ||
+    process.env.GOOGLE_SHEET_SNAPSHOT_URL ||
+    process.env.GOOGLE_SHEET_URL ||
     null
   )
 }
@@ -205,18 +236,14 @@ function createJobStatus(extra = {}) {
 
 function createEmptyState(symbols) {
   return {
-    version: 2,
+    version: 3,
     symbolsKey: buildSymbolsKey(symbols),
     symbols,
     quotesBySymbol: {},
     fundamentalsBySymbol: {},
     jobs: {
       quotes: createJobStatus(),
-      marketCap: createJobStatus(),
-      eps: createJobStatus({
-        nextSymbolIndex: 0,
-        lastProcessedSymbols: [],
-      }),
+      fundamentals: createJobStatus(),
     },
   }
 }
@@ -251,16 +278,7 @@ function parsePersistedState(parsed, symbols) {
   nextState.fundamentalsBySymbol = pickSymbolsObjectEntries(parsed.fundamentalsBySymbol, symbols)
   nextState.jobs = {
     quotes: createJobStatus(parsed.jobs?.quotes),
-    marketCap: createJobStatus(parsed.jobs?.marketCap),
-    eps: createJobStatus({
-      nextSymbolIndex: numberOrNull(parsed.jobs?.eps?.nextSymbolIndex) || 0,
-      lastProcessedSymbols: Array.isArray(parsed.jobs?.eps?.lastProcessedSymbols)
-        ? parsed.jobs.eps.lastProcessedSymbols.filter(Boolean)
-        : [],
-      lastAttemptAt: parsed.jobs?.eps?.lastAttemptAt || null,
-      lastSuccessAt: parsed.jobs?.eps?.lastSuccessAt || null,
-      lastError: parsed.jobs?.eps?.lastError || null,
-    }),
+    fundamentals: createJobStatus(parsed.jobs?.fundamentals || parsed.jobs?.marketCap || parsed.jobs?.eps),
   }
 
   return nextState
@@ -393,6 +411,8 @@ function getOrCreateFundamental(state, symbol) {
     marketCapFetchedAt: null,
     eps: null,
     epsFetchedAt: null,
+    peRatio: null,
+    peRatioFetchedAt: null,
   }
 
   state.fundamentalsBySymbol[symbol] = nextFundamental
@@ -403,8 +423,15 @@ function hasAnyQuoteData(state, symbols) {
   return symbols.some((symbol) => state.quotesBySymbol[symbol])
 }
 
-function hasAnyMarketCapData(state, symbols) {
-  return symbols.some((symbol) => numberOrNull(state.fundamentalsBySymbol[symbol]?.marketCap) !== null)
+function hasAnyFundamentalSnapshotData(state, symbols) {
+  return symbols.some((symbol) => {
+    const cached = state.fundamentalsBySymbol[symbol]
+    return (
+      numberOrNull(cached?.marketCap) !== null ||
+      numberOrNull(cached?.eps) !== null ||
+      numberOrNull(cached?.peRatio) !== null
+    )
+  })
 }
 
 function isFresh(timestamp, ttlMs, nowMs = Date.now()) {
@@ -423,53 +450,6 @@ function positionPercent(stock) {
   }
 
   return ((stock.currentPrice - stock.week52Low) / (stock.week52High - stock.week52Low)) * 100
-}
-
-function extractLatestReportedEps(earningsPayload) {
-  if (!Array.isArray(earningsPayload?.earnings)) {
-    return null
-  }
-
-  const datedEarnings = earningsPayload.earnings
-    .map((entry) => ({
-      actual: numberOrNull(entry?.eps_actual),
-      date: readString(entry?.date),
-    }))
-    .filter((entry) => entry.actual !== null && entry.date)
-    .sort((left, right) => new Date(right.date).getTime() - new Date(left.date).getTime())
-
-  const selectedQuarterlyEarnings = []
-
-  for (const entry of datedEarnings) {
-    const entryTime = new Date(entry.date).getTime()
-
-    if (!Number.isFinite(entryTime)) {
-      continue
-    }
-
-    const isDistinctQuarter = selectedQuarterlyEarnings.every(
-      (selected) => Math.abs(entryTime - selected.time) >= 45 * 24 * 60 * 60 * 1000,
-    )
-
-    if (!isDistinctQuarter) {
-      continue
-    }
-
-    selectedQuarterlyEarnings.push({
-      time: entryTime,
-      actual: entry.actual,
-    })
-
-    if (selectedQuarterlyEarnings.length === 4) {
-      break
-    }
-  }
-
-  if (selectedQuarterlyEarnings.length === 4) {
-    return selectedQuarterlyEarnings.reduce((sum, entry) => sum + entry.actual, 0)
-  }
-
-  return datedEarnings[0]?.actual ?? null
 }
 
 function normalizeQuote(symbol, quote, fundamentals) {
@@ -496,15 +476,15 @@ function normalizeQuote(symbol, quote, fundamentals) {
     quoteRange.high,
   )
   const marketCap = firstNumber(
+    fundamentals?.marketCap,
     quote?.market_capitalization,
     quote?.marketCap,
-    fundamentals?.marketCap,
   )
   const eps = firstNumber(
+    fundamentals?.eps,
     quote?.eps,
     quote?.eps_ttm,
     quote?.trailing_eps,
-    fundamentals?.eps,
   )
   const name =
     readString(quote?.name) ||
@@ -513,7 +493,12 @@ function normalizeQuote(symbol, quote, fundamentals) {
     symbol
   const computedPeRatio =
     typeof currentPrice === 'number' && typeof eps === 'number' && eps > 0 ? currentPrice / eps : null
-  const providerPeRatio = firstNumber(quote?.pe, quote?.pe_ratio, quote?.price_earnings_ratio)
+  const providerPeRatio = firstNumber(
+    fundamentals?.peRatio,
+    quote?.pe,
+    quote?.pe_ratio,
+    quote?.price_earnings_ratio,
+  )
   const peRatio =
     providerPeRatio ??
     computedPeRatio
@@ -567,20 +552,6 @@ function twelveDataErrorMessage(body, fallback) {
   return readString(body.message) || readString(body.status) || fallback
 }
 
-function fmpErrorMessage(body, fallback) {
-  if (!body || typeof body !== 'object') {
-    return fallback
-  }
-
-  return (
-    readString(body['Error Message']) ||
-    readString(body.message) ||
-    readString(body.error) ||
-    readString(body.Information) ||
-    fallback
-  )
-}
-
 async function fetchTwelveDataJson(url, apiKey, label) {
   const response = await fetch(url, {
     headers: {
@@ -608,33 +579,6 @@ async function fetchTwelveDataJson(url, apiKey, label) {
     throw new Error(
       `${label} returned ${body.code || 'error'}: ${twelveDataErrorMessage(body, 'unexpected response')}`,
     )
-  }
-
-  return body
-}
-
-async function fetchFmpJson(url, label) {
-  const response = await fetch(url, {
-    headers: {
-      'user-agent': 'nima-stock-tracker/1.0',
-      accept: 'application/json',
-    },
-  })
-  const bodyText = await response.text()
-
-  let body = null
-  try {
-    body = bodyText ? JSON.parse(bodyText) : null
-  } catch {
-    throw new Error(`${label} returned non-JSON data: ${bodyText.slice(0, 160)}`)
-  }
-
-  if (!response.ok) {
-    throw new Error(`${label} returned ${response.status}: ${fmpErrorMessage(body, bodyText.slice(0, 160))}`)
-  }
-
-  if (!Array.isArray(body) && (!body || typeof body !== 'object')) {
-    throw new Error(`${label} rejected the request: ${fmpErrorMessage(body, 'unexpected response')}`)
   }
 
   return body
@@ -704,136 +648,191 @@ async function fetchBatchQuotes(symbols, apiKey) {
   return extractBatchQuotes(symbols, body)
 }
 
-async function fetchEarnings(symbol, apiKey) {
-  const url = new URL('https://api.twelvedata.com/earnings')
-  url.searchParams.set('symbol', symbol)
+function parseCsv(text) {
+  const rows = []
+  let currentRow = []
+  let currentCell = ''
+  let inQuotes = false
 
-  return fetchTwelveDataJson(url, apiKey, `Twelve Data earnings ${symbol}`)
-}
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    const nextChar = text[index + 1]
 
-function extractBatchMarketCaps(symbols, body) {
-  const bySymbol = new Map()
-
-  const pushMarketCap = (candidate, fallbackSymbol = null) => {
-    if (!candidate || typeof candidate !== 'object') {
-      return
-    }
-
-    const nested = candidate.data && typeof candidate.data === 'object' ? candidate.data : candidate
-    const symbol =
-      readString(nested?.symbol)?.toUpperCase() ||
-      readString(fallbackSymbol)?.toUpperCase() ||
-      null
-    const marketCap = firstNumber(
-      nested?.marketCap,
-      nested?.market_cap,
-      nested?.marketCapitalization,
-      nested?.marketCapInUsd,
-      nested?.marketCapUsd,
-      nested?.mktCap,
-      nested?.capitalization,
-      nested?.value,
-    )
-
-    if (!symbol || marketCap === null || !symbols.includes(symbol)) {
-      return
-    }
-
-    bySymbol.set(symbol, marketCap)
-  }
-
-  if (Array.isArray(body)) {
-    for (const row of body) {
-      pushMarketCap(row)
-    }
-
-    return bySymbol
-  }
-
-  if (!body || typeof body !== 'object') {
-    return bySymbol
-  }
-
-  if (body.status === 'ok' && body.data) {
-    return extractBatchMarketCaps(symbols, body.data)
-  }
-
-  pushMarketCap(body)
-
-  for (const [key, value] of Object.entries(body)) {
-    if (key === 'status' || key === 'code' || key === 'message' || key === 'Error Message') {
+    if (char === '"') {
+      if (inQuotes && nextChar === '"') {
+        currentCell += '"'
+        index += 1
+      } else {
+        inQuotes = !inQuotes
+      }
       continue
     }
 
-    const fallbackSymbol = symbols.includes(key.toUpperCase()) ? key : null
-    pushMarketCap(value, fallbackSymbol)
-  }
-
-  return bySymbol
-}
-
-async function fetchBatchMarketCaps(symbols, apiKey) {
-  if (!symbols.length) {
-    return new Map()
-  }
-
-  const url = new URL('https://financialmodelingprep.com/stable/market-capitalization-batch')
-  url.searchParams.set('symbols', symbols.join(','))
-  url.searchParams.set('apikey', apiKey)
-
-  const body = await fetchFmpJson(url, `FMP batch market cap (${symbols.length} symbols)`)
-  return extractBatchMarketCaps(symbols, body)
-}
-
-function extractProfileMarketCap(body) {
-  const rows = Array.isArray(body) ? body : [body]
-
-  for (const row of rows) {
-    if (!row || typeof row !== 'object') {
+    if (char === ',' && !inQuotes) {
+      currentRow.push(currentCell)
+      currentCell = ''
       continue
     }
 
-    const nested = row.data && typeof row.data === 'object' ? row.data : row
-    const profile =
-      Array.isArray(nested.profile) && nested.profile.length
-        ? nested.profile[0]
-        : nested.profile && typeof nested.profile === 'object'
-          ? nested.profile
-          : nested
-    const marketCap = firstNumber(
-      profile?.marketCap,
-      profile?.market_cap,
-      profile?.marketCapitalization,
-      profile?.marketCapInUsd,
-      profile?.marketCapUsd,
-      profile?.mktCap,
-    )
+    if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && nextChar === '\n') {
+        index += 1
+      }
 
-    if (marketCap === null) {
+      currentRow.push(currentCell)
+      rows.push(currentRow)
+      currentRow = []
+      currentCell = ''
       continue
     }
 
-    return {
-      marketCap,
-      name: readString(profile?.companyName) || readString(profile?.name),
-      exchange: readString(profile?.exchangeShortName) || readString(profile?.exchange),
-    }
+    currentCell += char
+  }
+
+  if (currentCell.length || currentRow.length) {
+    currentRow.push(currentCell)
+    rows.push(currentRow)
+  }
+
+  return rows.filter((row) => row.some((cell) => readString(cell) !== null))
+}
+
+function normalizeSnapshotHeader(header) {
+  return (readString(header) || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
+function extractSnapshotRecord(candidate) {
+  if (!candidate || typeof candidate !== 'object') {
+    return null
+  }
+
+  const symbol = normalizeSymbolValue(candidate.symbol || candidate.ticker || candidate.stock || candidate.googleTicker)
+
+  if (!symbol) {
+    return null
   }
 
   return {
-    marketCap: null,
-    name: null,
-    exchange: null,
+    symbol,
+    marketCap: firstNumber(
+      candidate.marketCap,
+      candidate.marketcap,
+      candidate.market_cap,
+      candidate.marketCapitalization,
+    ),
+    eps: firstNumber(candidate.eps, candidate.epsttm, candidate.eps_ttm),
+    peRatio: firstNumber(
+      candidate.pe,
+      candidate.peratio,
+      candidate.pe_ratio,
+      candidate.priceearningsratio,
+      candidate.price_earnings_ratio,
+    ),
+    name: readString(candidate.name) || readString(candidate.companyName),
+    exchange: readString(candidate.exchange) || readString(candidate.exchangeShortName),
   }
 }
 
-async function fetchProfileMarketCap(symbol, apiKey) {
-  const url = new URL('https://financialmodelingprep.com/stable/profile')
-  url.searchParams.set('symbol', symbol)
-  url.searchParams.set('apikey', apiKey)
+function extractSnapshotPayloadFromCsv(text) {
+  const rows = parseCsv(text)
 
-  const body = await fetchFmpJson(url, `FMP profile ${symbol}`)
-  return extractProfileMarketCap(body)
+  if (!rows.length) {
+    return {
+      updatedAt: null,
+      rowsBySymbol: new Map(),
+    }
+  }
+
+  const [headerRow, ...valueRows] = rows
+  const headers = headerRow.map((header) => normalizeSnapshotHeader(header))
+  const symbolIndex = headers.findIndex((header) => ['symbol', 'ticker', 'stock', 'googleticker'].includes(header))
+
+  if (symbolIndex === -1) {
+    throw new Error('Google Sheet snapshot CSV is missing a symbol column.')
+  }
+
+  const rowsBySymbol = new Map()
+
+  for (const row of valueRows) {
+    const candidate = Object.fromEntries(headers.map((header, index) => [header, row[index] ?? null]))
+    const record = extractSnapshotRecord(candidate)
+
+    if (!record) {
+      continue
+    }
+
+    rowsBySymbol.set(record.symbol, record)
+  }
+
+  return {
+    updatedAt: null,
+    rowsBySymbol,
+  }
+}
+
+function extractSnapshotPayloadFromJson(body) {
+  const rowsBySymbol = new Map()
+  const rawRows =
+    Array.isArray(body)
+      ? body
+      : Array.isArray(body?.rows)
+        ? body.rows
+        : Array.isArray(body?.stocks)
+          ? body.stocks
+          : Array.isArray(body?.data)
+            ? body.data
+            : []
+
+  for (const row of rawRows) {
+    const record = extractSnapshotRecord(row)
+
+    if (!record) {
+      continue
+    }
+
+    rowsBySymbol.set(record.symbol, record)
+  }
+
+  return {
+    updatedAt:
+      readString(body?.updatedAt) ||
+      readString(body?.snapshotAt) ||
+      readString(body?.generatedAt) ||
+      readString(body?.lastUpdatedAt) ||
+      null,
+    rowsBySymbol,
+  }
+}
+
+async function fetchGoogleSheetsSnapshot(url) {
+  const response = await fetch(url, {
+    headers: {
+      'user-agent': 'nima-stock-tracker/1.0',
+      accept: 'application/json,text/csv,text/plain,*/*',
+    },
+  })
+  const bodyText = await response.text()
+
+  if (!response.ok) {
+    throw new Error(`Google Sheet snapshot returned ${response.status}: ${bodyText.slice(0, 160)}`)
+  }
+
+  const trimmed = bodyText.trim()
+  const contentType = response.headers.get('content-type') || ''
+
+  if (contentType.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    let body = null
+
+    try {
+      body = trimmed ? JSON.parse(trimmed) : null
+    } catch {
+      throw new Error(`Google Sheet snapshot returned invalid JSON: ${trimmed.slice(0, 160)}`)
+    }
+
+    return extractSnapshotPayloadFromJson(body)
+  }
+
+  return extractSnapshotPayloadFromCsv(bodyText)
 }
 
 function quoteNeedsRefresh(state, nowMs, force = false) {
@@ -844,77 +843,44 @@ function quoteNeedsRefresh(state, nowMs, force = false) {
   return !isFresh(state.jobs.quotes.lastSuccessAt, quoteCacheTtlMs, nowMs)
 }
 
-function marketCapNeedsRefresh(state, symbols, nowMs, force = false) {
+function fundamentalsNeedRefresh(state, symbols, nowMs, force = false) {
   if (force) {
     return true
   }
 
-  const hasMissingMarketCap = symbols.some((symbol) => {
+  const hasMissingFundamentals = symbols.some((symbol) => {
     const fundamental = state.fundamentalsBySymbol[symbol]
-    return numberOrNull(fundamental?.marketCap) === null
+    return (
+      numberOrNull(fundamental?.marketCap) === null ||
+      numberOrNull(fundamental?.eps) === null ||
+      numberOrNull(fundamental?.peRatio) === null
+    )
   })
 
-  if (hasMissingMarketCap) {
-    const retryWindowMs = marketCapRetryWindowMs(state.jobs.marketCap.lastError)
-    return !isFresh(state.jobs.marketCap.lastAttemptAt, retryWindowMs, nowMs)
+  if (hasMissingFundamentals) {
+    const retryWindowMs = fundamentalsRetryWindowMs(state.jobs.fundamentals.lastError)
+    return !isFresh(state.jobs.fundamentals.lastAttemptAt, retryWindowMs, nowMs)
   }
 
-  return !isFresh(state.jobs.marketCap.lastSuccessAt, marketCapCacheTtlMs, nowMs)
+  return !isFresh(state.jobs.fundamentals.lastSuccessAt, fundamentalsCacheTtlMs, nowMs)
 }
 
-function marketCapRetryWindowMs(lastError) {
+function fundamentalsRetryWindowMs(lastError) {
   const message = readString(lastError)
 
   if (!message) {
-    return marketCapPartialRetryMs
+    return fundamentalsPartialRetryMs
   }
 
-  if (message.includes('429') || message.includes('API credits') || message.includes('Limit Reach')) {
-    return marketCapRateLimitRetryMs
+  if (message.includes('still do not have snapshot values cached')) {
+    return fundamentalsPartialRetryMs
   }
 
-  if (message.includes('still do not have market cap data cached')) {
-    return marketCapPartialRetryMs
+  if (message.includes('401') || message.includes('403')) {
+    return fundamentalsFailureRetryMs
   }
 
-  return marketCapFailureRetryMs
-}
-
-function epsNeedsRefresh(fundamental, nowMs) {
-  if (!fundamental) {
-    return true
-  }
-
-  if (numberOrNull(fundamental.eps) === null) {
-    return true
-  }
-
-  return !isFresh(fundamental.epsFetchedAt, epsCacheTtlMs, nowMs)
-}
-
-function pickNextEpsSymbols(state, symbols, nowMs, limit) {
-  if (!symbols.length || limit <= 0) {
-    return []
-  }
-
-  const startIndex = Math.min(state.jobs.eps.nextSymbolIndex || 0, symbols.length - 1)
-  const selected = []
-  let lastVisitedIndex = startIndex
-
-  for (let offset = 0; offset < symbols.length && selected.length < limit; offset += 1) {
-    const currentIndex = (startIndex + offset) % symbols.length
-    const symbol = symbols[currentIndex]
-    const fundamental = state.fundamentalsBySymbol[symbol]
-
-    lastVisitedIndex = currentIndex
-
-    if (epsNeedsRefresh(fundamental, nowMs)) {
-      selected.push(symbol)
-    }
-  }
-
-  state.jobs.eps.nextSymbolIndex = symbols.length ? (lastVisitedIndex + 1) % symbols.length : 0
-  return selected
+  return fundamentalsFailureRetryMs
 }
 
 function summarizeBackgroundFailure(label, errorMessage) {
@@ -928,23 +894,19 @@ function summarizeBackgroundFailure(label, errorMessage) {
     return `${label} refresh needs TWELVE_DATA_API_KEY on Render.`
   }
 
-  if (message.includes('Missing FMP_API_KEY')) {
-    return `${label} refresh needs FMP_API_KEY on Render.`
-  }
-
-  if (message.includes('429') || message.includes('API credits')) {
-    return `${label} refresh hit a provider rate limit and will retry automatically.`
+  if (message.includes('Missing GOOGLE_SHEETS_SNAPSHOT_URL')) {
+    return `${label} refresh needs GOOGLE_SHEETS_SNAPSHOT_URL on Render.`
   }
 
   if (message.includes('401') || message.includes('403')) {
-    return `${label} refresh was rejected by the provider. Check your API plan and permissions.`
+    return `${label} refresh was rejected. Check that the Google Sheet snapshot is published and accessible from Render.`
   }
 
-  if (message.includes('still do not have market cap data cached')) {
+  if (message.includes('still do not have snapshot values cached')) {
     return `${label} refresh is still warming the remaining symbols in the background.`
   }
 
-  if (message.includes('returned no usable market cap values')) {
+  if (message.includes('returned no usable snapshot rows')) {
     return `${label} refresh returned no usable values. The server will retry automatically.`
   }
 
@@ -988,17 +950,6 @@ async function refreshQuotes(state, symbols, { force = false } = {}) {
         readString(nextQuote.exchange) ||
         readString(nextQuote.mic_code) ||
         fundamental.exchange
-
-      const quotedMarketCap = firstNumber(
-        nextQuote.market_capitalization,
-        nextQuote.marketCap,
-        nextQuote.market_cap,
-      )
-
-      if (quotedMarketCap !== null) {
-        fundamental.marketCap = quotedMarketCap
-        fundamental.marketCapFetchedAt = new Date().toISOString()
-      }
     }
 
     state.jobs.quotes.lastSuccessAt = new Date().toISOString()
@@ -1010,134 +961,75 @@ async function refreshQuotes(state, symbols, { force = false } = {}) {
   }
 }
 
-async function refreshMarketCaps(state, symbols, { force = false } = {}) {
+async function refreshFundamentalsSnapshot(state, symbols, { force = false } = {}) {
   const nowMs = Date.now()
 
-  if (!marketCapNeedsRefresh(state, symbols, nowMs, force)) {
+  if (!fundamentalsNeedRefresh(state, symbols, nowMs, force)) {
     return false
   }
 
-  state.jobs.marketCap.lastAttemptAt = new Date(nowMs).toISOString()
+  state.jobs.fundamentals.lastAttemptAt = new Date(nowMs).toISOString()
 
-  const apiKey = getFmpApiKey()
-  if (!apiKey) {
-    state.jobs.marketCap.lastError = 'Missing FMP_API_KEY'
+  const snapshotUrl = getGoogleSheetsSnapshotUrl()
+  if (!snapshotUrl) {
+    state.jobs.fundamentals.lastError = 'Missing GOOGLE_SHEETS_SNAPSHOT_URL'
     return true
   }
 
   try {
-    const marketCapsBySymbol = await fetchBatchMarketCaps(symbols, apiKey)
-    const fetchedAt = new Date().toISOString()
-    const fallbackErrors = []
-    const fallbackSymbols = symbols
-      .filter((symbol) => marketCapsBySymbol.get(symbol) === undefined)
-      .slice(0, marketCapProfileBatchSize)
+    const snapshot = await fetchGoogleSheetsSnapshot(snapshotUrl)
+    const fetchedAt = snapshot.updatedAt || new Date().toISOString()
 
-    for (const symbol of fallbackSymbols) {
-      try {
-        const profileData = await fetchProfileMarketCap(symbol, apiKey)
-
-        if (profileData.marketCap === null) {
-          continue
-        }
-
-        marketCapsBySymbol.set(symbol, profileData.marketCap)
-
-        const fundamental = getOrCreateFundamental(state, symbol)
-        fundamental.name = profileData.name || fundamental.name
-        fundamental.exchange = profileData.exchange || fundamental.exchange
-      } catch (error) {
-        fallbackErrors.push(
-          `${symbol}: ${error instanceof Error ? error.message : 'Unknown FMP profile refresh error'}`,
-        )
-      }
-    }
-
-    if (!marketCapsBySymbol.size) {
-      throw new Error('FMP batch market cap returned no usable market cap values.')
+    if (!snapshot.rowsBySymbol.size) {
+      throw new Error('Google Sheet snapshot returned no usable snapshot rows.')
     }
 
     for (const symbol of symbols) {
       const fundamental = getOrCreateFundamental(state, symbol)
-      const nextMarketCap = marketCapsBySymbol.get(symbol)
+      const snapshotRow = snapshot.rowsBySymbol.get(symbol)
 
-      if (nextMarketCap !== undefined) {
-        fundamental.marketCap = nextMarketCap
+      if (snapshotRow) {
+        if (snapshotRow.marketCap !== null) {
+          fundamental.marketCap = snapshotRow.marketCap
+        }
+        if (snapshotRow.eps !== null) {
+          fundamental.eps = snapshotRow.eps
+        }
+        if (snapshotRow.peRatio !== null) {
+          fundamental.peRatio = snapshotRow.peRatio
+        }
+        fundamental.name = snapshotRow.name || fundamental.name
+        fundamental.exchange = snapshotRow.exchange || fundamental.exchange
         fundamental.marketCapFetchedAt = fetchedAt
+        fundamental.epsFetchedAt = fetchedAt
+        fundamental.peRatioFetchedAt = fetchedAt
       }
     }
 
-    const remainingMissingCount = symbols.filter(
-      (symbol) => numberOrNull(state.fundamentalsBySymbol[symbol]?.marketCap) === null,
-    ).length
+    const remainingMissingValueCount = symbols.filter((symbol) => {
+      const cached = state.fundamentalsBySymbol[symbol]
+      return (
+        numberOrNull(cached?.marketCap) === null ||
+        numberOrNull(cached?.eps) === null ||
+        numberOrNull(cached?.peRatio) === null
+      )
+    }).length
 
-    state.jobs.marketCap.lastSuccessAt = fetchedAt
-    state.jobs.marketCap.lastError = fallbackErrors[0]
-      ? `${fallbackErrors.length} FMP profile market cap requests failed (${fallbackErrors
-          .slice(0, 2)
-          .join('; ')}).`
-      : remainingMissingCount > 0
-        ? `${remainingMissingCount} configured symbols still do not have market cap data cached from FMP yet.`
+    state.jobs.fundamentals.lastSuccessAt = fetchedAt
+    state.jobs.fundamentals.lastError =
+      remainingMissingValueCount > 0
+        ? `${remainingMissingValueCount} configured symbols still do not have snapshot values cached.`
         : null
     return true
   } catch (error) {
-    state.jobs.marketCap.lastError =
-      error instanceof Error ? error.message : 'Unknown market cap refresh error'
+    state.jobs.fundamentals.lastError =
+      error instanceof Error ? error.message : 'Unknown Google Sheet snapshot refresh error'
     return true
   }
 }
 
-async function refreshEpsBatch(state, symbols) {
-  const nowMs = Date.now()
-  const symbolsToRefresh = pickNextEpsSymbols(state, symbols, nowMs, epsBatchSize)
-
-  if (!symbolsToRefresh.length) {
-    return false
-  }
-
-  state.jobs.eps.lastAttemptAt = new Date(nowMs).toISOString()
-  state.jobs.eps.lastProcessedSymbols = symbolsToRefresh
-
-  const apiKey = getTwelveDataApiKey()
-  if (!apiKey) {
-    state.jobs.eps.lastError = 'Missing TWELVE_DATA_API_KEY'
-    return true
-  }
-
-  let hadSuccess = false
-  let rateLimited = false
-  const failedSymbols = []
-
-  for (const symbol of symbolsToRefresh) {
-    try {
-      const eps = extractLatestReportedEps(await fetchEarnings(symbol, apiKey))
-      const fundamental = getOrCreateFundamental(state, symbol)
-
-      fundamental.eps = eps
-      fundamental.epsFetchedAt = new Date().toISOString()
-      hadSuccess = true
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown EPS refresh error'
-      failedSymbols.push(`${symbol}: ${message}`)
-
-      if (message.includes('429') || message.includes('API credits')) {
-        rateLimited = true
-        break
-      }
-    }
-  }
-
-  if (hadSuccess) {
-    state.jobs.eps.lastSuccessAt = new Date().toISOString()
-  }
-
-  state.jobs.eps.lastError = failedSymbols.length
-    ? rateLimited
-      ? `Rate limited while refreshing EPS (${failedSymbols[0]}).`
-      : `Failed to refresh EPS for ${failedSymbols.join('; ')}`
-    : null
-
-  return true
+function getFundamentalsUpdatedAt(state) {
+  return state.jobs.fundamentals.lastSuccessAt || null
 }
 
 function buildStatusCopy({
@@ -1147,11 +1039,12 @@ function buildStatusCopy({
   missingEpsCount,
   missingPeRatioCount,
   stockCount,
+  fundamentalsLoaded,
 }) {
   if (!hasQuotes) {
     return {
       headline: 'Fetching live data. This page will build itself out in stages as fresh data arrives.',
-      detail: `Stage 1 loads stock prices for ${stockCount} symbols. Market Cap, EPS, and P/E will fill in from the shared cache after quotes arrive.`,
+      detail: `Stage 1 loads stock prices for ${stockCount} symbols. Market Cap, EPS, and P/E fill in after the Google Sheet snapshot is merged on the server.`,
     }
   }
 
@@ -1162,30 +1055,23 @@ function buildStatusCopy({
     }
   }
 
-  if (missingMarketCapCount > 0) {
+  if (!fundamentalsLoaded) {
     return {
-      headline: 'Stock prices are current. The page is now filling in Market Cap data.',
-      detail: 'This app intentionally loads in stages to stay inside the Twelve Data minute limit. EPS and P/E begin after the Market Cap cache warms.',
+      headline: 'Stock prices are current. The page is now merging the Google Sheet snapshot.',
+      detail: 'Market Cap, EPS, and P/E come from your published Google Sheet snapshot while price data stays live from Twelve Data.',
     }
   }
 
-  if (missingEpsCount > 0) {
+  if (missingMarketCapCount > 0 || missingEpsCount > 0 || missingPeRatioCount > 0) {
     return {
-      headline: 'Stock prices and Market Cap are current. EPS and P/E are still filling in.',
-      detail: `EPS refresh is throttled to ${epsBatchSize} symbol${epsBatchSize === 1 ? '' : 's'} per minute so the app stays inside your Twelve Data limit.`,
-    }
-  }
-
-  if (missingPeRatioCount > 0) {
-    return {
-      headline: 'Stock prices, Market Cap, and EPS are current. P/E ratios are still settling.',
-      detail: 'P/E ratios are recalculated from the newest prices and cached EPS as soon as both values are available for each stock.',
+      headline: 'Quotes are current. Some Google Sheet snapshot values are still blank.',
+      detail: 'The app will keep serving the last good fundamentals cache while your Google Sheet snapshot fills in any missing Market Cap, EPS, or P/E values.',
     }
   }
 
   return {
     headline: 'All data is current.',
-    detail: 'Quotes refresh about once per minute, Market Cap refreshes daily, and EPS plus P/E stay cached until the next fundamentals refresh window.',
+    detail: 'Quotes refresh about once per minute, and Market Cap, EPS, plus P/E come from the latest Google Sheet snapshot cached on the server.',
   }
 }
 
@@ -1195,19 +1081,14 @@ function buildWarningText({
   const warnings = []
 
   const quoteWarning = summarizeBackgroundFailure('Quote', state.jobs.quotes.lastError)
-  const marketCapWarning = summarizeBackgroundFailure('Market Cap', state.jobs.marketCap.lastError)
-  const epsWarning = summarizeBackgroundFailure('EPS', state.jobs.eps.lastError)
+  const fundamentalsWarning = summarizeBackgroundFailure('Google Sheet snapshot', state.jobs.fundamentals.lastError)
 
   if (quoteWarning) {
     warnings.push(quoteWarning)
   }
 
-  if (marketCapWarning) {
-    warnings.push(marketCapWarning)
-  }
-
-  if (epsWarning) {
-    warnings.push(epsWarning)
+  if (fundamentalsWarning) {
+    warnings.push(fundamentalsWarning)
   }
 
   return warnings.join(' ') || null
@@ -1229,23 +1110,14 @@ function buildStocksPayload(state, symbols) {
   const missingPeRatioCount = stocks.filter((stock) => stock.peRatio === null).length
 
   const quoteFresh = isFresh(state.jobs.quotes.lastSuccessAt, quoteCacheTtlMs + backgroundRefreshIntervalMs, nowMs)
-  const marketCapFresh =
-    missingMarketCapCount === 0 &&
-    isFresh(state.jobs.marketCap.lastSuccessAt, marketCapCacheTtlMs, nowMs)
-  const peRatioFresh = quoteFresh && missingPeRatioCount === 0
-  const nextEpsSymbols = pickNextEpsSymbols(
-    {
-      jobs: {
-        eps: {
-          nextSymbolIndex: state.jobs.eps.nextSymbolIndex,
-        },
-      },
-      fundamentalsBySymbol: state.fundamentalsBySymbol,
-    },
-    symbols,
-    nowMs,
-    Math.min(3, symbols.length),
-  )
+  const fundamentalsUpdatedAt = getFundamentalsUpdatedAt(state)
+  const fundamentalsLoaded = Boolean(fundamentalsUpdatedAt)
+  const fundamentalsFresh =
+    fundamentalsLoaded &&
+    isFresh(fundamentalsUpdatedAt, fundamentalsCacheTtlMs + backgroundRefreshIntervalMs, nowMs)
+  const marketCapFresh = fundamentalsFresh && missingMarketCapCount === 0
+  const epsFresh = fundamentalsFresh && missingEpsCount === 0
+  const peRatioFresh = fundamentalsFresh && missingPeRatioCount === 0
   const statusCopy = buildStatusCopy({
     hasQuotes: hasAnyQuoteData(state, symbols),
     quoteFresh,
@@ -1253,22 +1125,19 @@ function buildStocksPayload(state, symbols) {
     missingEpsCount,
     missingPeRatioCount,
     stockCount: symbols.length,
+    fundamentalsLoaded,
   })
   const buildStage =
     missingQuoteCount === symbols.length
       ? 'quotes'
-      : missingMarketCapCount > 0
-        ? 'market-cap'
-        : missingEpsCount > 0
-          ? 'eps'
-          : missingPeRatioCount > 0
-            ? 'eps'
-          : 'complete'
+      : fundamentalsLoaded
+        ? 'complete'
+        : 'fundamentals'
 
   return {
-    updatedAt: state.jobs.quotes.lastSuccessAt || state.jobs.marketCap.lastSuccessAt || null,
-    updatedLabel: formatIsoLabel(state.jobs.quotes.lastSuccessAt || state.jobs.marketCap.lastSuccessAt),
-    source: 'Render Key Value cache backed by Twelve Data quotes, FMP Market Cap, and a throttled Twelve Data EPS queue',
+    updatedAt: state.jobs.quotes.lastSuccessAt || fundamentalsUpdatedAt || null,
+    updatedLabel: formatIsoLabel(state.jobs.quotes.lastSuccessAt || fundamentalsUpdatedAt),
+    source: 'Render Key Value cache backed by Twelve Data quotes and a Google Sheet fundamentals snapshot',
     warning: buildWarningText({
       state,
     }),
@@ -1292,22 +1161,20 @@ function buildStocksPayload(state, symbols) {
         missingCount: missingQuoteCount,
       },
       marketCap: {
-        updatedAt: state.jobs.marketCap.lastSuccessAt,
-        updatedLabel: formatIsoLabel(state.jobs.marketCap.lastSuccessAt),
+        updatedAt: fundamentalsUpdatedAt,
+        updatedLabel: formatIsoLabel(fundamentalsUpdatedAt),
         stale: !marketCapFresh,
         missingCount: missingMarketCapCount,
       },
       eps: {
-        updatedAt: state.jobs.eps.lastSuccessAt,
-        updatedLabel: formatIsoLabel(state.jobs.eps.lastSuccessAt),
-        stale: missingEpsCount > 0,
+        updatedAt: fundamentalsUpdatedAt,
+        updatedLabel: formatIsoLabel(fundamentalsUpdatedAt),
+        stale: !epsFresh,
         missingCount: missingEpsCount,
-        batchSize: epsBatchSize,
-        nextSymbols: nextEpsSymbols,
       },
       peRatio: {
-        updatedAt: state.jobs.quotes.lastSuccessAt || state.jobs.eps.lastSuccessAt,
-        updatedLabel: formatIsoLabel(state.jobs.quotes.lastSuccessAt || state.jobs.eps.lastSuccessAt),
+        updatedAt: fundamentalsUpdatedAt,
+        updatedLabel: formatIsoLabel(fundamentalsUpdatedAt),
         stale: !peRatioFresh,
         missingCount: missingPeRatioCount,
       },
@@ -1323,16 +1190,12 @@ function buildErrorHint(error) {
     return 'TWELVE_DATA_API_KEY is missing on Render. Add it under the web service Environment settings and redeploy.'
   }
 
-  if (message.includes('Missing FMP_API_KEY')) {
-    return 'FMP_API_KEY is missing on Render. Add it under the web service Environment settings and redeploy.'
-  }
-
-  if (message.includes('429') || message.includes('API credits')) {
-    return 'The provider rate-limited a refresh. The server will keep retrying in the background while serving the last good cache.'
+  if (message.includes('Missing GOOGLE_SHEETS_SNAPSHOT_URL')) {
+    return 'GOOGLE_SHEETS_SNAPSHOT_URL is missing on Render. Point it to your published Google Sheet snapshot and redeploy.'
   }
 
   if (message.includes('401') || message.includes('403')) {
-    return 'One of the provider keys was rejected. Verify that the Render environment variables are correct and that the plan includes the endpoints this app uses.'
+    return 'The Google Sheet snapshot was rejected. Verify that the snapshot is public or otherwise reachable from Render.'
   }
 
   if (message.includes('Key Value')) {
@@ -1344,8 +1207,7 @@ function buildErrorHint(error) {
 
 async function runBackgroundRefreshCycle({
   forceQuotes = false,
-  forceMarketCap = false,
-  allowEps = true,
+  forceFundamentals = false,
 } = {}) {
   if (backgroundRefreshPromise) {
     return backgroundRefreshPromise
@@ -1355,7 +1217,7 @@ async function runBackgroundRefreshCycle({
     const symbols = await readConfiguredSymbols()
     const state = await ensureState(symbols)
     const hadQuotes = hasAnyQuoteData(state, symbols)
-    const hadMarketCap = hasAnyMarketCapData(state, symbols)
+    const hadFundamentals = hasAnyFundamentalSnapshotData(state, symbols)
 
     await refreshQuotes(state, symbols, { force: forceQuotes })
 
@@ -1364,15 +1226,11 @@ async function runBackgroundRefreshCycle({
       return buildStocksPayload(state, symbols)
     }
 
-    await refreshMarketCaps(state, symbols, { force: forceMarketCap })
+    await refreshFundamentalsSnapshot(state, symbols, { force: forceFundamentals })
 
-    if (!hadMarketCap && hasAnyMarketCapData(state, symbols)) {
+    if (!hadFundamentals && hasAnyFundamentalSnapshotData(state, symbols)) {
       await writePersistedState(state)
       return buildStocksPayload(state, symbols)
-    }
-
-    if (allowEps) {
-      await refreshEpsBatch(state, symbols)
     }
 
     await writePersistedState(state)
@@ -1419,8 +1277,7 @@ async function getStocksPayload({ forceRefresh = false } = {}) {
   if (!hasAnyQuoteData(state, symbols)) {
     queueRefresh({
       forceQuotes: true,
-      forceMarketCap: false,
-      allowEps: false,
+      forceFundamentals: false,
     })
 
     return buildStocksPayload(state, symbols)
@@ -1431,22 +1288,16 @@ async function getStocksPayload({ forceRefresh = false } = {}) {
   if (forceRefresh) {
     queueRefresh({
       forceQuotes: true,
-      forceMarketCap: false,
-      allowEps: false,
+      forceFundamentals: false,
     })
 
     return buildStocksPayload(state, symbols)
   }
 
-  if (quoteNeedsRefresh(state, nowMs) || marketCapNeedsRefresh(state, symbols, nowMs)) {
+  if (quoteNeedsRefresh(state, nowMs) || fundamentalsNeedRefresh(state, symbols, nowMs)) {
     queueRefresh({
       forceQuotes: quoteNeedsRefresh(state, nowMs),
-      forceMarketCap: marketCapNeedsRefresh(state, symbols, nowMs),
-      allowEps: false,
-    })
-  } else if (symbols.some((symbol) => epsNeedsRefresh(state.fundamentalsBySymbol[symbol], nowMs))) {
-    queueRefresh({
-      allowEps: true,
+      forceFundamentals: fundamentalsNeedRefresh(state, symbols, nowMs),
     })
   }
 

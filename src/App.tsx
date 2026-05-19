@@ -24,18 +24,13 @@ type FreshnessStatus = {
   missingCount: number
 }
 
-type EpsFreshnessStatus = FreshnessStatus & {
-  batchSize: number
-  nextSymbols: string[]
-}
-
 type StocksPayload = {
   updatedAt: string | null
   updatedLabel: string | null
   source: string | null
   warning: string | null
   stale: boolean
-  buildStage?: 'quotes' | 'market-cap' | 'eps' | 'complete'
+  buildStage?: 'quotes' | 'fundamentals' | 'complete'
   isBuilding?: boolean
   readyCounts?: {
     quotes: number
@@ -49,7 +44,7 @@ type StocksPayload = {
   freshness: {
     quotes: FreshnessStatus
     marketCap: FreshnessStatus
-    eps: EpsFreshnessStatus
+    eps: FreshnessStatus
     peRatio: FreshnessStatus
   }
   stocks: StockQuote[]
@@ -143,7 +138,7 @@ function formatSortMetricLabel(sortMetric: SortMetric) {
   }
 }
 
-function formatFreshnessLabel(label: string, freshness: FreshnessStatus | EpsFreshnessStatus) {
+function formatFreshnessLabel(label: string, freshness: FreshnessStatus) {
   if (freshness.updatedLabel) {
     return `${label}: ${freshness.updatedLabel}${freshness.stale ? ' (refreshing)' : ''}`
   }
@@ -285,18 +280,11 @@ function App() {
           </span>
         </div>
 
-        {payload?.freshness.eps.nextSymbols.length ? (
-          <p className="queue-text">
-            Next EPS refresh batch: {payload.freshness.eps.nextSymbols.join(', ')}. The server refreshes up to{' '}
-            {payload.freshness.eps.batchSize} symbol{payload.freshness.eps.batchSize === 1 ? '' : 's'} per minute.
-          </p>
-        ) : null}
-
         {payload?.isBuilding ? (
           <div className="build-banner" role="status" aria-live="polite">
             <strong>Fetching information in stages.</strong>
             <span>
-              The page loads stock prices first, then Market Cap, then EPS and P/E as cache refresh jobs complete.
+              The page loads stock prices first, then merges Market Cap, EPS, and P/E from the Google Sheet snapshot.
             </span>
           </div>
         ) : null}
@@ -360,15 +348,23 @@ function App() {
                   <strong>{formatCompanyLabel(stock)}</strong>
                 </div>
                 <div className="number-cell">
-                  {renderPendingValue(stock.eps, formatEps, payload?.buildStage === 'quotes' || payload?.buildStage === 'market-cap' ? 'Queued' : 'Fetching')}
+                  {renderPendingValue(
+                    stock.eps,
+                    formatEps,
+                    payload?.buildStage === 'quotes' ? 'Queued' : 'Fetching',
+                  )}
                 </div>
                 <div className="number-cell">
                   {payload?.isBuilding && stock.peRatio === null
-                    ? <span className="pending-chip">{payload?.buildStage === 'quotes' || payload?.buildStage === 'market-cap' ? 'Queued' : 'Fetching'}</span>
+                    ? <span className="pending-chip">{payload?.buildStage === 'quotes' ? 'Queued' : 'Fetching'}</span>
                     : formatPeRatio(stock.peRatio)}
                 </div>
                 <div className="number-cell">
-                  {renderPendingValue(stock.marketCap, formatMarketCap, payload?.buildStage === 'quotes' ? 'Queued' : 'Fetching')}
+                  {renderPendingValue(
+                    stock.marketCap,
+                    formatMarketCap,
+                    payload?.buildStage === 'quotes' ? 'Queued' : 'Fetching',
+                  )}
                 </div>
                 <div className="slider-cell">
                   <div className={hasSlider ? 'slider-track' : 'slider-track slider-disabled'}>

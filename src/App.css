@@ -156,13 +156,6 @@ h1 {
   background: #eef7db;
 }
 
-.queue-text {
-  margin: 0 0 14px;
-  color: var(--muted);
-  font-size: 0.92rem;
-  font-weight: 600;
-}
-
 .build-banner {
   display: grid;
   gap: 4px;
