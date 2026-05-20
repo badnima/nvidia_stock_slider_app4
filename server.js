@@ -32,7 +32,7 @@ const fundamentalsPartialRetryMs =
 const fundamentalsFailureRetryMs =
   parsePositiveInt(process.env.GOOGLE_SHEETS_FAILURE_RETRY_SECONDS, 3600) * 1000
 const backgroundRefreshIntervalMs =
-  parsePositiveInt(process.env.BACKGROUND_REFRESH_INTERVAL_SECONDS, 60) * 1000
+  parsePositiveInt(process.env.BACKGROUND_REFRESH_INTERVAL_SECONDS, 120) * 1000
 
 let keyValueClient = null
 let keyValueConnectPromise = null
