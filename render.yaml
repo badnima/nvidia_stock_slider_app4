@@ -27,7 +27,7 @@ services:
       - key: GOOGLE_SHEETS_FAILURE_RETRY_SECONDS
         value: "3600"
       - key: BACKGROUND_REFRESH_INTERVAL_SECONDS
-        value: "60"
+        value: "120"
 
   - type: keyvalue
     name: nima-stock-tracker-cache
