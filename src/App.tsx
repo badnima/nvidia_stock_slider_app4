@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { DatabaseZap, RefreshCcw, Server, TrendingUp } from 'lucide-react'
 import './App.css'
 
-type SortMetric = 'positionPercent' | 'eps' | 'peRatio' | 'marketCap'
+type SortMetric = 'positionPercent' | 'eps' | 'peRatio' | 'beta' | 'marketCap'
 
 type StockQuote = {
   symbol: string
@@ -139,6 +139,8 @@ function formatSortMetricLabel(sortMetric: SortMetric) {
       return 'EPS'
     case 'peRatio':
       return 'P/E'
+    case 'beta':
+      return 'Beta'
     case 'marketCap':
       return 'Market Cap'
     case 'positionPercent':
@@ -271,6 +273,7 @@ function App() {
   const sortableColumns: Array<{ key: SortMetric; label: string }> = [
     { key: 'eps', label: 'EPS' },
     { key: 'peRatio', label: 'P/E' },
+    { key: 'beta', label: 'Beta' },
     { key: 'marketCap', label: 'Market Cap' },
     { key: 'positionPercent', label: '52-Week Position' },
   ]
@@ -414,7 +417,17 @@ function App() {
                 {sortMetric === 'peRatio' ? '↓' : ''}
               </span>
             </button>
-            <span>Beta</span>
+            <button
+              type="button"
+              className={sortMetric === 'beta' ? 'header-sort active' : 'header-sort'}
+              onClick={() => setSortMetric('beta')}
+              aria-pressed={sortMetric === 'beta'}
+            >
+              Beta
+              <span className="header-sort-arrow" aria-hidden="true">
+                {sortMetric === 'beta' ? '↓' : ''}
+              </span>
+            </button>
             <button
               type="button"
               className={sortMetric === 'marketCap' ? 'header-sort active' : 'header-sort'}
