@@ -22,9 +22,11 @@ type FreshnessStatus = {
   updatedLabel: string | null
   stale: boolean
   missingCount: number
+  paused?: boolean
 }
 
 type StocksPayload = {
+  quoteRefreshEnabled: boolean
   updatedAt: string | null
   updatedLabel: string | null
   source: string | null
@@ -140,7 +142,15 @@ function formatSortMetricLabel(sortMetric: SortMetric) {
 
 function formatFreshnessLabel(label: string, freshness: FreshnessStatus) {
   if (freshness.updatedLabel) {
+    if (freshness.paused) {
+      return `${label}: ${freshness.updatedLabel} (paused)`
+    }
+
     return `${label}: ${freshness.updatedLabel}${freshness.stale ? ' (refreshing)' : ''}`
+  }
+
+  if (freshness.paused) {
+    return `${label}: paused`
   }
 
   return `${label}: warming cache`
@@ -150,6 +160,7 @@ function App() {
   const [payload, setPayload] = useState<StocksPayload | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [isUpdatingQuoteRefresh, setIsUpdatingQuoteRefresh] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [sortMetric, setSortMetric] = useState<SortMetric>('positionPercent')
 
@@ -181,6 +192,33 @@ function App() {
     } finally {
       setIsLoading(false)
       setIsRefreshing(false)
+    }
+  }, [])
+
+  const updateQuoteRefresh = useCallback(async (enabled: boolean) => {
+    setIsUpdatingQuoteRefresh(true)
+    setError(null)
+
+    try {
+      const response = await fetch('/api/quote-refresh', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ enabled }),
+      })
+      const nextPayload = (await response.json()) as StocksPayload | ApiErrorPayload
+
+      if (!response.ok) {
+        const apiError = nextPayload as ApiErrorPayload
+        throw new Error([apiError.error, apiError.hint].filter(Boolean).join(' '))
+      }
+
+      setPayload(nextPayload as StocksPayload)
+    } catch (updateError) {
+      setError(updateError instanceof Error ? updateError.message : 'Unable to update quote refresh.')
+    } finally {
+      setIsUpdatingQuoteRefresh(false)
     }
   }, [])
 
@@ -216,6 +254,7 @@ function App() {
     ? `${payload.readyCounts.quotes}/${payload.readyCounts.total} prices · ${payload.readyCounts.marketCap}/${payload.readyCounts.total} Market Cap · ${payload.readyCounts.eps}/${payload.readyCounts.total} EPS · ${payload.readyCounts.peRatio}/${payload.readyCounts.total} P/E`
     : 'Building live data in stages'
   const sortSummary = `Sorted high to low by ${formatSortMetricLabel(sortMetric)}`
+  const quoteRefreshEnabled = payload?.quoteRefreshEnabled ?? true
 
   const sortableColumns: Array<{ key: SortMetric; label: string }> = [
     { key: 'eps', label: 'EPS' },
@@ -244,15 +283,38 @@ function App() {
             {error ? <p className="warning-text">{error}</p> : null}
           </div>
 
-          <button
-            className="refresh-button"
-            type="button"
-            onClick={() => void loadStocks({ refresh: true })}
-            disabled={isRefreshing}
-          >
-            <RefreshCcw size={18} className={isRefreshing ? 'spin' : undefined} />
-            {isRefreshing ? 'Refreshing' : 'Refresh Quotes'}
-          </button>
+          <div className="header-actions">
+            <button
+              className="refresh-button"
+              type="button"
+              onClick={() => void loadStocks({ refresh: true })}
+              disabled={isRefreshing || isUpdatingQuoteRefresh || !quoteRefreshEnabled}
+            >
+              <RefreshCcw size={18} className={isRefreshing ? 'spin' : undefined} />
+              {quoteRefreshEnabled ? (isRefreshing ? 'Refreshing' : 'Refresh Quotes') : 'Quotes Paused'}
+            </button>
+
+            <label className="toggle-control">
+              <span className="toggle-copy">
+                <span className="toggle-title">Live Quote Refresh</span>
+                <span className="toggle-subtitle">
+                  {quoteRefreshEnabled ? 'On: Twelve Data requests are enabled.' : 'Off: Twelve Data requests are paused.'}
+                </span>
+              </span>
+              <span className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={quoteRefreshEnabled}
+                  onChange={(event) => {
+                    void updateQuoteRefresh(event.target.checked)
+                  }}
+                  disabled={isUpdatingQuoteRefresh}
+                  aria-label="Toggle live quote refresh"
+                />
+                <span className="toggle-slider" aria-hidden="true" />
+              </span>
+            </label>
+          </div>
         </div>
       </header>
 
@@ -262,7 +324,15 @@ function App() {
             <Server size={16} />
             {payload?.source ?? 'Shared cache warming on the server'}
           </span>
-          <span className={payload?.freshness.quotes.stale ? 'status-pill stale' : 'status-pill'}>
+          <span
+            className={
+              payload?.freshness.quotes.paused
+                ? 'status-pill paused'
+                : payload?.freshness.quotes.stale
+                  ? 'status-pill stale'
+                  : 'status-pill'
+            }
+          >
             <TrendingUp size={16} />
             {quoteSummary}
           </span>

@@ -43,6 +43,8 @@ let backgroundRefreshPromise = null
 let backgroundRefreshStarted = false
 let backgroundRefreshTimer = null
 
+app.use(express.json())
+
 function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(value, 10)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
@@ -236,11 +238,14 @@ function createJobStatus(extra = {}) {
 
 function createEmptyState(symbols) {
   return {
-    version: 3,
+    version: 4,
     symbolsKey: buildSymbolsKey(symbols),
     symbols,
     quotesBySymbol: {},
     fundamentalsBySymbol: {},
+    settings: {
+      quoteRefreshEnabled: true,
+    },
     jobs: {
       quotes: createJobStatus(),
       fundamentals: createJobStatus(),
@@ -276,6 +281,12 @@ function parsePersistedState(parsed, symbols) {
 
   nextState.quotesBySymbol = pickSymbolsObjectEntries(parsed.quotesBySymbol, symbols)
   nextState.fundamentalsBySymbol = pickSymbolsObjectEntries(parsed.fundamentalsBySymbol, symbols)
+  nextState.settings.quoteRefreshEnabled =
+    typeof parsed.settings?.quoteRefreshEnabled === 'boolean'
+      ? parsed.settings.quoteRefreshEnabled
+      : typeof parsed.quoteRefreshEnabled === 'boolean'
+        ? parsed.quoteRefreshEnabled
+        : true
   nextState.jobs = {
     quotes: createJobStatus(parsed.jobs?.quotes),
     fundamentals: createJobStatus(parsed.jobs?.fundamentals || parsed.jobs?.marketCap || parsed.jobs?.eps),
@@ -432,6 +443,10 @@ function hasAnyFundamentalSnapshotData(state, symbols) {
       numberOrNull(cached?.peRatio) !== null
     )
   })
+}
+
+function isQuoteRefreshEnabled(state) {
+  return state?.settings?.quoteRefreshEnabled !== false
 }
 
 function isFresh(timestamp, ttlMs, nowMs = Date.now()) {
@@ -836,6 +851,10 @@ async function fetchGoogleSheetsSnapshot(url) {
 }
 
 function quoteNeedsRefresh(state, nowMs, force = false) {
+  if (!isQuoteRefreshEnabled(state)) {
+    return false
+  }
+
   if (force) {
     return true
   }
@@ -914,6 +933,10 @@ function summarizeBackgroundFailure(label, errorMessage) {
 }
 
 async function refreshQuotes(state, symbols, { force = false } = {}) {
+  if (!isQuoteRefreshEnabled(state)) {
+    return false
+  }
+
   const nowMs = Date.now()
 
   if (!quoteNeedsRefresh(state, nowMs, force)) {
@@ -1035,12 +1058,29 @@ function getFundamentalsUpdatedAt(state) {
 function buildStatusCopy({
   hasQuotes,
   quoteFresh,
+  quoteRefreshEnabled,
   missingMarketCapCount,
   missingEpsCount,
   missingPeRatioCount,
   stockCount,
   fundamentalsLoaded,
 }) {
+  if (!quoteRefreshEnabled) {
+    if (!hasQuotes) {
+      return {
+        headline: 'Live quote refresh is paused.',
+        detail:
+          'No new Twelve Data requests will be sent until you turn quote refresh back on. Google Sheet fundamentals can still warm in the background.',
+      }
+    }
+
+    return {
+      headline: 'Live quote refresh is paused.',
+      detail:
+        'Cached quote data remains visible, and no new Twelve Data requests will be sent until you turn quote refresh back on.',
+    }
+  }
+
   if (!hasQuotes) {
     return {
       headline: 'Fetching live data. This page will build itself out in stages as fresh data arrives.',
@@ -1080,7 +1120,9 @@ function buildWarningText({
 }) {
   const warnings = []
 
-  const quoteWarning = summarizeBackgroundFailure('Quote', state.jobs.quotes.lastError)
+  const quoteWarning = isQuoteRefreshEnabled(state)
+    ? summarizeBackgroundFailure('Quote', state.jobs.quotes.lastError)
+    : null
   const fundamentalsWarning = summarizeBackgroundFailure('Google Sheet snapshot', state.jobs.fundamentals.lastError)
 
   if (quoteWarning) {
@@ -1109,7 +1151,10 @@ function buildStocksPayload(state, symbols) {
   const missingEpsCount = stocks.filter((stock) => stock.eps === null).length
   const missingPeRatioCount = stocks.filter((stock) => stock.peRatio === null).length
 
-  const quoteFresh = isFresh(state.jobs.quotes.lastSuccessAt, quoteCacheTtlMs + backgroundRefreshIntervalMs, nowMs)
+  const quoteRefreshEnabled = isQuoteRefreshEnabled(state)
+  const quoteFresh = quoteRefreshEnabled
+    ? isFresh(state.jobs.quotes.lastSuccessAt, quoteCacheTtlMs + backgroundRefreshIntervalMs, nowMs)
+    : Boolean(state.jobs.quotes.lastSuccessAt)
   const fundamentalsUpdatedAt = getFundamentalsUpdatedAt(state)
   const fundamentalsLoaded = Boolean(fundamentalsUpdatedAt)
   const fundamentalsFresh =
@@ -1121,6 +1166,7 @@ function buildStocksPayload(state, symbols) {
   const statusCopy = buildStatusCopy({
     hasQuotes: hasAnyQuoteData(state, symbols),
     quoteFresh,
+    quoteRefreshEnabled,
     missingMarketCapCount,
     missingEpsCount,
     missingPeRatioCount,
@@ -1135,13 +1181,14 @@ function buildStocksPayload(state, symbols) {
         : 'fundamentals'
 
   return {
+    quoteRefreshEnabled,
     updatedAt: state.jobs.quotes.lastSuccessAt || fundamentalsUpdatedAt || null,
     updatedLabel: formatIsoLabel(state.jobs.quotes.lastSuccessAt || fundamentalsUpdatedAt),
     source: 'Render Key Value cache backed by Twelve Data quotes and a Google Sheet fundamentals snapshot',
     warning: buildWarningText({
       state,
     }),
-    stale: !quoteFresh,
+    stale: quoteRefreshEnabled ? !quoteFresh : false,
     buildStage,
     isBuilding: buildStage !== 'complete',
     readyCounts: {
@@ -1157,7 +1204,8 @@ function buildStocksPayload(state, symbols) {
       quotes: {
         updatedAt: state.jobs.quotes.lastSuccessAt,
         updatedLabel: formatIsoLabel(state.jobs.quotes.lastSuccessAt),
-        stale: !quoteFresh,
+        stale: quoteRefreshEnabled ? !quoteFresh : false,
+        paused: !quoteRefreshEnabled,
         missingCount: missingQuoteCount,
       },
       marketCap: {
@@ -1266,6 +1314,7 @@ function startBackgroundRefreshLoop() {
 async function getStocksPayload({ forceRefresh = false } = {}) {
   const symbols = await readConfiguredSymbols()
   const state = await ensureState(symbols)
+  const quoteRefreshEnabled = isQuoteRefreshEnabled(state)
 
   startBackgroundRefreshLoop()
   const queueRefresh = (options) => {
@@ -1276,8 +1325,8 @@ async function getStocksPayload({ forceRefresh = false } = {}) {
 
   if (!hasAnyQuoteData(state, symbols)) {
     queueRefresh({
-      forceQuotes: true,
-      forceFundamentals: false,
+      forceQuotes: quoteRefreshEnabled,
+      forceFundamentals: true,
     })
 
     return buildStocksPayload(state, symbols)
@@ -1287,7 +1336,7 @@ async function getStocksPayload({ forceRefresh = false } = {}) {
 
   if (forceRefresh) {
     queueRefresh({
-      forceQuotes: true,
+      forceQuotes: quoteRefreshEnabled,
       forceFundamentals: false,
     })
 
@@ -1302,6 +1351,26 @@ async function getStocksPayload({ forceRefresh = false } = {}) {
   }
 
   return buildStocksPayload(state, symbols)
+}
+
+async function setQuoteRefreshEnabled(enabled) {
+  const symbols = await readConfiguredSymbols()
+  const state = await ensureState(symbols)
+
+  state.settings.quoteRefreshEnabled = enabled
+
+  if (!enabled) {
+    state.jobs.quotes.lastError = null
+    await writePersistedState(state)
+    return buildStocksPayload(state, symbols)
+  }
+
+  state.jobs.quotes.lastError = null
+  await writePersistedState(state)
+  return runBackgroundRefreshCycle({
+    forceQuotes: true,
+    forceFundamentals: false,
+  })
 }
 
 app.use(express.static(distDir))
@@ -1323,6 +1392,29 @@ app.get('/api/stocks', async (req, res) => {
     res.status(502).json({
       error: 'Unable to load stock data right now.',
       detail: error instanceof Error ? error.message : 'Unknown stock data error.',
+      hint: buildErrorHint(error),
+    })
+  }
+})
+
+app.post('/api/quote-refresh', async (req, res) => {
+  try {
+    if (typeof req.body?.enabled !== 'boolean') {
+      res.status(400).json({
+        error: 'Quote refresh setting is invalid.',
+        detail: 'Send { "enabled": true } or { "enabled": false }.',
+      })
+      return
+    }
+
+    const payload = await setQuoteRefreshEnabled(req.body.enabled)
+    res.set('Cache-Control', 'no-store')
+    res.json(payload)
+  } catch (error) {
+    console.error('Failed to update quote refresh setting:', error)
+    res.status(502).json({
+      error: 'Unable to update quote refresh right now.',
+      detail: error instanceof Error ? error.message : 'Unknown quote refresh setting error.',
       hint: buildErrorHint(error),
     })
   }

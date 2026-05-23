@@ -119,6 +119,92 @@ h1 {
   opacity: 0.72;
 }
 
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.toggle-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 42px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.toggle-copy {
+  display: grid;
+  gap: 2px;
+}
+
+.toggle-title {
+  color: #ffffff;
+  font-size: 0.84rem;
+  font-weight: 800;
+}
+
+.toggle-subtitle {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  width: 50px;
+  height: 28px;
+}
+
+.toggle-switch input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.toggle-switch input:disabled {
+  cursor: wait;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.24);
+  transition: background-color 140ms ease;
+}
+
+.toggle-slider::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.24);
+  transition: transform 140ms ease;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background: rgba(118, 185, 0, 0.92);
+}
+
+.toggle-switch input:checked + .toggle-slider::after {
+  transform: translateX(22px);
+}
+
 .spin {
   animation: spin 900ms linear infinite;
 }
@@ -154,6 +240,12 @@ h1 {
   border-color: rgba(118, 185, 0, 0.35);
   color: var(--text);
   background: #eef7db;
+}
+
+.status-pill.paused {
+  border-color: rgba(255, 218, 128, 0.55);
+  color: var(--text);
+  background: #fff5d6;
 }
 
 .build-banner {
@@ -415,6 +507,10 @@ h1 {
     align-items: stretch;
   }
 
+  .header-actions {
+    justify-content: flex-start;
+  }
+
   .refresh-button {
     align-self: flex-start;
   }
@@ -449,6 +545,11 @@ h1 {
   .header-inner,
   .page-shell {
     width: min(100% - 24px, 1280px);
+  }
+
+  .toggle-control {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .slider-scale {
