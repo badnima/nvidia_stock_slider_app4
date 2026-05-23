@@ -238,7 +238,7 @@ function createJobStatus(extra = {}) {
 
 function createEmptyState(symbols) {
   return {
-    version: 4,
+    version: 5,
     symbolsKey: buildSymbolsKey(symbols),
     symbols,
     quotesBySymbol: {},
@@ -418,6 +418,8 @@ function getOrCreateFundamental(state, symbol) {
     symbol,
     name: null,
     exchange: null,
+    beta: null,
+    betaFetchedAt: null,
     marketCap: null,
     marketCapFetchedAt: null,
     eps: null,
@@ -438,6 +440,7 @@ function hasAnyFundamentalSnapshotData(state, symbols) {
   return symbols.some((symbol) => {
     const cached = state.fundamentalsBySymbol[symbol]
     return (
+      numberOrNull(cached?.beta) !== null ||
       numberOrNull(cached?.marketCap) !== null ||
       numberOrNull(cached?.eps) !== null ||
       numberOrNull(cached?.peRatio) !== null
@@ -501,6 +504,10 @@ function normalizeQuote(symbol, quote, fundamentals) {
     quote?.eps_ttm,
     quote?.trailing_eps,
   )
+  const beta = firstNumber(
+    fundamentals?.beta,
+    quote?.beta,
+  )
   const name =
     readString(quote?.name) ||
     readString(quote?.companyName) ||
@@ -521,6 +528,7 @@ function normalizeQuote(symbol, quote, fundamentals) {
   const normalized = {
     symbol,
     name,
+    beta,
     eps,
     peRatio,
     marketCap,
@@ -729,6 +737,12 @@ function extractSnapshotRecord(candidate) {
 
   return {
     symbol,
+    beta: firstNumber(
+      candidate.beta,
+      candidate.beta5y,
+      candidate.fiveYearBeta,
+      candidate.fiveyearbeta,
+    ),
     marketCap: firstNumber(
       candidate.marketCap,
       candidate.marketcap,
@@ -870,6 +884,7 @@ function fundamentalsNeedRefresh(state, symbols, nowMs, force = false) {
   const hasMissingFundamentals = symbols.some((symbol) => {
     const fundamental = state.fundamentalsBySymbol[symbol]
     return (
+      numberOrNull(fundamental?.beta) === null ||
       numberOrNull(fundamental?.marketCap) === null ||
       numberOrNull(fundamental?.eps) === null ||
       numberOrNull(fundamental?.peRatio) === null
@@ -1015,6 +1030,9 @@ async function refreshFundamentalsSnapshot(state, symbols, { force = false } = {
         if (snapshotRow.marketCap !== null) {
           fundamental.marketCap = snapshotRow.marketCap
         }
+        if (snapshotRow.beta !== null) {
+          fundamental.beta = snapshotRow.beta
+        }
         if (snapshotRow.eps !== null) {
           fundamental.eps = snapshotRow.eps
         }
@@ -1023,6 +1041,7 @@ async function refreshFundamentalsSnapshot(state, symbols, { force = false } = {
         }
         fundamental.name = snapshotRow.name || fundamental.name
         fundamental.exchange = snapshotRow.exchange || fundamental.exchange
+        fundamental.betaFetchedAt = fetchedAt
         fundamental.marketCapFetchedAt = fetchedAt
         fundamental.epsFetchedAt = fetchedAt
         fundamental.peRatioFetchedAt = fetchedAt
@@ -1032,6 +1051,7 @@ async function refreshFundamentalsSnapshot(state, symbols, { force = false } = {
     const remainingMissingValueCount = symbols.filter((symbol) => {
       const cached = state.fundamentalsBySymbol[symbol]
       return (
+        numberOrNull(cached?.beta) === null ||
         numberOrNull(cached?.marketCap) === null ||
         numberOrNull(cached?.eps) === null ||
         numberOrNull(cached?.peRatio) === null
@@ -1059,6 +1079,7 @@ function buildStatusCopy({
   hasQuotes,
   quoteFresh,
   quoteRefreshEnabled,
+  missingBetaCount,
   missingMarketCapCount,
   missingEpsCount,
   missingPeRatioCount,
@@ -1098,20 +1119,20 @@ function buildStatusCopy({
   if (!fundamentalsLoaded) {
     return {
       headline: 'Stock prices are current. The page is now merging the Google Sheet snapshot.',
-      detail: 'Market Cap, EPS, and P/E come from your published Google Sheet snapshot while price data stays live from Twelve Data.',
+      detail: 'Market Cap, EPS, P/E, and Beta come from your published Google Sheet snapshot while price data stays live from Twelve Data.',
     }
   }
 
-  if (missingMarketCapCount > 0 || missingEpsCount > 0 || missingPeRatioCount > 0) {
+  if (missingBetaCount > 0 || missingMarketCapCount > 0 || missingEpsCount > 0 || missingPeRatioCount > 0) {
     return {
       headline: 'Quotes are current. Some Google Sheet snapshot values are still blank.',
-      detail: 'The app will keep serving the last good fundamentals cache while your Google Sheet snapshot fills in any missing Market Cap, EPS, or P/E values.',
+      detail: 'The app will keep serving the last good fundamentals cache while your Google Sheet snapshot fills in any missing Beta, Market Cap, EPS, or P/E values.',
     }
   }
 
   return {
     headline: 'All data is current.',
-    detail: 'Quotes refresh about once per minute, and Market Cap, EPS, plus P/E come from the latest Google Sheet snapshot cached on the server.',
+    detail: 'Quotes refresh about once per minute, and Beta, Market Cap, EPS, plus P/E come from the latest Google Sheet snapshot cached on the server.',
   }
 }
 
@@ -1147,6 +1168,7 @@ function buildStocksPayload(state, symbols) {
   )
 
   const missingQuoteCount = stocks.filter((stock) => stock.currentPrice === null).length
+  const missingBetaCount = stocks.filter((stock) => stock.beta === null).length
   const missingMarketCapCount = stocks.filter((stock) => stock.marketCap === null).length
   const missingEpsCount = stocks.filter((stock) => stock.eps === null).length
   const missingPeRatioCount = stocks.filter((stock) => stock.peRatio === null).length
@@ -1160,6 +1182,7 @@ function buildStocksPayload(state, symbols) {
   const fundamentalsFresh =
     fundamentalsLoaded &&
     isFresh(fundamentalsUpdatedAt, fundamentalsCacheTtlMs + backgroundRefreshIntervalMs, nowMs)
+  const betaFresh = fundamentalsFresh && missingBetaCount === 0
   const marketCapFresh = fundamentalsFresh && missingMarketCapCount === 0
   const epsFresh = fundamentalsFresh && missingEpsCount === 0
   const peRatioFresh = fundamentalsFresh && missingPeRatioCount === 0
@@ -1167,6 +1190,7 @@ function buildStocksPayload(state, symbols) {
     hasQuotes: hasAnyQuoteData(state, symbols),
     quoteFresh,
     quoteRefreshEnabled,
+    missingBetaCount,
     missingMarketCapCount,
     missingEpsCount,
     missingPeRatioCount,
@@ -1193,6 +1217,7 @@ function buildStocksPayload(state, symbols) {
     isBuilding: buildStage !== 'complete',
     readyCounts: {
       quotes: symbols.length - missingQuoteCount,
+      beta: symbols.length - missingBetaCount,
       marketCap: symbols.length - missingMarketCapCount,
       eps: symbols.length - missingEpsCount,
       peRatio: symbols.length - missingPeRatioCount,
@@ -1213,6 +1238,12 @@ function buildStocksPayload(state, symbols) {
         updatedLabel: formatIsoLabel(fundamentalsUpdatedAt),
         stale: !marketCapFresh,
         missingCount: missingMarketCapCount,
+      },
+      beta: {
+        updatedAt: fundamentalsUpdatedAt,
+        updatedLabel: formatIsoLabel(fundamentalsUpdatedAt),
+        stale: !betaFresh,
+        missingCount: missingBetaCount,
       },
       eps: {
         updatedAt: fundamentalsUpdatedAt,

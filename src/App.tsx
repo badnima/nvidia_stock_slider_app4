@@ -7,6 +7,7 @@ type SortMetric = 'positionPercent' | 'eps' | 'peRatio' | 'marketCap'
 type StockQuote = {
   symbol: string
   name: string
+  beta: number | null
   eps: number | null
   peRatio: number | null
   marketCap: number | null
@@ -36,6 +37,7 @@ type StocksPayload = {
   isBuilding?: boolean
   readyCounts?: {
     quotes: number
+    beta: number
     marketCap: number
     eps: number
     peRatio: number
@@ -45,6 +47,7 @@ type StocksPayload = {
   statusDetail: string | null
   freshness: {
     quotes: FreshnessStatus
+    beta: FreshnessStatus
     marketCap: FreshnessStatus
     eps: FreshnessStatus
     peRatio: FreshnessStatus
@@ -80,6 +83,10 @@ function formatMarketCap(value: number | null) {
 }
 
 function formatEps(value: number | null) {
+  return typeof value === 'number' ? value.toFixed(2) : 'N/A'
+}
+
+function formatBeta(value: number | null) {
   return typeof value === 'number' ? value.toFixed(2) : 'N/A'
 }
 
@@ -240,6 +247,11 @@ function App() {
       ? `Market Cap: ${payload.stocks.length - payload.freshness.marketCap.missingCount}/${payload.stocks.length} ready`
       : formatFreshnessLabel('Market Cap', payload.freshness.marketCap)
     : 'Market Cap: warming cache'
+  const betaSummary = payload
+    ? payload.freshness.beta.missingCount > 0
+      ? `Beta: ${payload.stocks.length - payload.freshness.beta.missingCount}/${payload.stocks.length} ready`
+      : formatFreshnessLabel('Beta', payload.freshness.beta)
+    : 'Beta: warming cache'
   const epsSummary = payload
     ? payload.freshness.eps.missingCount > 0
       ? `EPS: ${payload.stocks.length - payload.freshness.eps.missingCount}/${payload.stocks.length} ready`
@@ -251,7 +263,7 @@ function App() {
       : formatFreshnessLabel('P/E', payload.freshness.peRatio)
     : 'P/E: warming cache'
   const stageSummary = payload?.readyCounts
-    ? `${payload.readyCounts.quotes}/${payload.readyCounts.total} prices · ${payload.readyCounts.marketCap}/${payload.readyCounts.total} Market Cap · ${payload.readyCounts.eps}/${payload.readyCounts.total} EPS · ${payload.readyCounts.peRatio}/${payload.readyCounts.total} P/E`
+    ? `${payload.readyCounts.quotes}/${payload.readyCounts.total} prices · ${payload.readyCounts.beta}/${payload.readyCounts.total} Beta · ${payload.readyCounts.marketCap}/${payload.readyCounts.total} Market Cap · ${payload.readyCounts.eps}/${payload.readyCounts.total} EPS · ${payload.readyCounts.peRatio}/${payload.readyCounts.total} P/E`
     : 'Building live data in stages'
   const sortSummary = `Sorted high to low by ${formatSortMetricLabel(sortMetric)}`
   const quoteRefreshEnabled = payload?.quoteRefreshEnabled ?? true
@@ -340,6 +352,10 @@ function App() {
             <DatabaseZap size={16} />
             {marketCapSummary}
           </span>
+          <span className={payload?.freshness.beta.missingCount ? 'status-pill stale' : 'status-pill'}>
+            <TrendingUp size={16} />
+            {betaSummary}
+          </span>
           <span className={payload?.freshness.eps.missingCount ? 'status-pill stale' : 'status-pill'}>
             <DatabaseZap size={16} />
             {epsSummary}
@@ -354,7 +370,7 @@ function App() {
           <div className="build-banner" role="status" aria-live="polite">
             <strong>Fetching information in stages.</strong>
             <span>
-              The page loads stock prices first, then merges Market Cap, EPS, and P/E from the Google Sheet snapshot.
+              The page loads stock prices first, then merges Beta, Market Cap, EPS, and P/E from the Google Sheet snapshot.
             </span>
           </div>
         ) : null}
@@ -376,20 +392,51 @@ function App() {
         <section className="table-shell" aria-label="52-week stock position table">
           <div className="table-grid table-head" role="row">
             <span>Stock</span>
-            {sortableColumns.map((column) => (
-              <button
-                key={column.key}
-                type="button"
-                className={sortMetric === column.key ? 'header-sort active' : 'header-sort'}
-                onClick={() => setSortMetric(column.key)}
-                aria-pressed={sortMetric === column.key}
-              >
-                {column.label}
-                <span className="header-sort-arrow" aria-hidden="true">
-                  {sortMetric === column.key ? '↓' : ''}
-                </span>
-              </button>
-            ))}
+            <button
+              type="button"
+              className={sortMetric === 'eps' ? 'header-sort active' : 'header-sort'}
+              onClick={() => setSortMetric('eps')}
+              aria-pressed={sortMetric === 'eps'}
+            >
+              EPS
+              <span className="header-sort-arrow" aria-hidden="true">
+                {sortMetric === 'eps' ? '↓' : ''}
+              </span>
+            </button>
+            <button
+              type="button"
+              className={sortMetric === 'peRatio' ? 'header-sort active' : 'header-sort'}
+              onClick={() => setSortMetric('peRatio')}
+              aria-pressed={sortMetric === 'peRatio'}
+            >
+              P/E
+              <span className="header-sort-arrow" aria-hidden="true">
+                {sortMetric === 'peRatio' ? '↓' : ''}
+              </span>
+            </button>
+            <span>Beta</span>
+            <button
+              type="button"
+              className={sortMetric === 'marketCap' ? 'header-sort active' : 'header-sort'}
+              onClick={() => setSortMetric('marketCap')}
+              aria-pressed={sortMetric === 'marketCap'}
+            >
+              Market Cap
+              <span className="header-sort-arrow" aria-hidden="true">
+                {sortMetric === 'marketCap' ? '↓' : ''}
+              </span>
+            </button>
+            <button
+              type="button"
+              className={sortMetric === 'positionPercent' ? 'header-sort active' : 'header-sort'}
+              onClick={() => setSortMetric('positionPercent')}
+              aria-pressed={sortMetric === 'positionPercent'}
+            >
+              52-Week Position
+              <span className="header-sort-arrow" aria-hidden="true">
+                {sortMetric === 'positionPercent' ? '↓' : ''}
+              </span>
+            </button>
           </div>
 
           {isLoading && !payload ? (
@@ -428,6 +475,13 @@ function App() {
                   {payload?.isBuilding && stock.peRatio === null
                     ? <span className="pending-chip">{payload?.buildStage === 'quotes' ? 'Queued' : 'Fetching'}</span>
                     : formatPeRatio(stock.peRatio)}
+                </div>
+                <div className="number-cell">
+                  {renderPendingValue(
+                    stock.beta,
+                    formatBeta,
+                    payload?.buildStage === 'quotes' ? 'Queued' : 'Fetching',
+                  )}
                 </div>
                 <div className="number-cell">
                   {renderPendingValue(
